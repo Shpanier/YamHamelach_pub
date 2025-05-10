@@ -2,16 +2,20 @@ import ast
 import json
 import os
 import pickle
+from pathlib import Path
 # import tempfile
-# from typing import Tuple
+# from typing import TupleP
 
 import cv2
 import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use('Agg')  # Set the backend to Agg before importing pyplot
 
 # import numpy as np
 import pandas as pd
 import streamlit as st
 from matplotlib.lines import Line2D
+from dotenv import load_dotenv
 
 
 # Function to load an image and convert to RGB for display
@@ -177,20 +181,66 @@ def visualize_match(
     if debug:
         plt.show()
     else:
+        plt.close('all')  # Close any existing figures
         st.pyplot(fig)
+        plt.close(fig)  # Close the figure after displaying
 
 
 # Main function for visualization
 def main():
-    from dotenv import load_dotenv
-
-    load_dotenv()
+    # Get the absolute path to the script's directory
+    script_dir = Path(__file__).parent.absolute()
+    
+    # Debug information about paths
+    print("Current working directory:", os.getcwd())
+    print("Script directory:", script_dir)
+    
+    # Check for .env files in multiple locations
+    possible_env_locations = [
+        script_dir / '.env',
+        Path.cwd() / '.env',
+        Path.home() / '.env'
+    ]
+    
+    print("\nChecking for .env files in:")
+    for loc in possible_env_locations:
+        print(f"- {loc}: {'EXISTS' if loc.exists() else 'NOT FOUND'}")
+    
+    # Load .env file from the script's directory
+    env_path = script_dir / '.env'
+    print("\nLoading .env from:", env_path)
+    
+    # Print the contents of the .env file if it exists
+    if env_path.exists():
+        print("\nContents of .env file:")
+        with open(env_path, 'r') as f:
+            print(f.read())
+    else:
+        print("\nWARNING: .env file not found at:", env_path)
+    
+    # Load environment variables
+    load_dotenv(dotenv_path=env_path, override=True)
+    
+    # Debug print all relevant environment variables
+    print("\nEnvironment variables after loading .env:")
+    for key in ["BASE_PATH", "IMAGES_IN", "PATCHES_IN", "SIFT_MATCHES_1000", 
+                "SIFT_MATCHES_W_TP", "SIFT_MATCHES_W_TP_W_HOMO", "PATCHES_CACHE"]:
+        print(f"{key}: {os.getenv(key)}")
+    
     DEBUG = os.getenv("DEBUG", "False").lower() in ["true", "1", "t"]
-
+    DEBUG_DISPLAY = os.getenv("DEBUG_DISPLAY", "False").lower() in ["true", "1", "t"]
+    print("\nDEBUG: " + str(DEBUG))
+    print("DEBUG_DISPLAY: " + str(DEBUG_DISPLAY))
+    
     base_path = os.getenv("BASE_PATH")
+    if not base_path:
+        raise ValueError("BASE_PATH environment variable is not set!")
+    print("\nbase_path: " + base_path)
+    
     IMAGES_IN_path = os.path.join(base_path, os.getenv("IMAGES_IN"))
     PATCHES_IN = os.path.join(base_path, os.getenv("PATCHES_IN"))
-
+    
+    sift_debug_file = os.path.join(base_path, os.getenv("SIFT_MATCHES_1000"))
     # A csv file with matches (patches matched)
     _sift_matches_w_tp = os.getenv("SIFT_MATCHES_W_TP")
     csv_sift_matches_w_tp_w_homo = os.path.join(
@@ -200,11 +250,14 @@ def main():
     patches_key_dec_cache = os.path.join(base_path, os.getenv("PATCHES_CACHE"))
 
     # Define output filename * file with raw for each match
-    input_main_csv_file = os.path.join(base_path, csv_sift_matches_w_tp_w_homo)
+    if (DEBUG == 1):
+        input_main_csv_file = os.path.join(base_path, sift_debug_file)
+    else:
+        input_main_csv_file = os.path.join(base_path, csv_sift_matches_w_tp_w_homo)
 
     if input_main_csv_file is not None:
         # Debug flag to visualize the first match automatically
-        if DEBUG == 1:
+        if DEBUG_DISPLAY == 1:
             print("Debug mode is ON: Displaying the first match in the file.")
             df = pd.read_csv(input_main_csv_file)
             df["matches"] = df["matches"].apply(ast.literal_eval)
@@ -213,12 +266,13 @@ def main():
                 PATCHES_IN,
                 IMAGES_IN_path,
                 patches_key_dec_cache,
-                DEBUG,
+                DEBUG_DISPLAY,
             )
         else:
             # Streamlit UI
-            st.title("Image Matches Visualization")
+            st.title("Image Matches Visualization , loading from: " + input_main_csv_file)
             # Read CSV and parse it
+            print("Reading CSV file: " + input_main_csv_file)
             df = pd.read_csv(input_main_csv_file)
 
             # Sort the DataFrame by the third column (number of matches) in descending order
@@ -247,7 +301,7 @@ def main():
 
             # Visualize selected match
             visualize_match(
-                row, PATCHES_IN, IMAGES_IN_path, patches_key_dec_cache, DEBUG
+                row, PATCHES_IN, IMAGES_IN_path, patches_key_dec_cache, DEBUG_DISPLAY
             )
 
 
