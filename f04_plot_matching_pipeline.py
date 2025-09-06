@@ -1,530 +1,1032 @@
 """
-Fragment Match Visualization Script - Homography Error Based
+Interactive Fragment Match Visualization App - Streamlined Version
 
-This script displays the top N most similar fragment matches side by side,
-sorted by minimum homography error (best geometric consistency).
-Reads from the SQLite database created by the fragment matching pipeline
-with homography error computation.
+This Streamlit app provides comprehensive tools to explore fragment matches
+with emphasis on homography error analysis.
 
-Dependencies:
-    - cv2 (OpenCV): For image loading and processing
-    - matplotlib: For visualization
-    - sqlite3: For database access
-    - numpy: For image array operations
-    - dotenv: For loading configuration
+Requirements:
+pip install streamlit opencv-python numpy pandas plotly sqlite3 pillow
+
+Run with: streamlit run fragment_viewer.py
 """
 
-import sqlite3
-import numpy as np
+import streamlit as st
 import cv2
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-from matplotlib.gridspec import GridSpec
+import numpy as np
+import pandas as pd
+import sqlite3
 import os
-from typing import List, Tuple, Optional
-from dotenv import load_dotenv
 import pickle
+from PIL import Image
+import plotly.graph_objects as go
+import plotly.express as px
+from typing import List, Tuple, Dict, Optional
+import base64
+from io import BytesIO
 
+# Page configuration
+st.set_page_config(
+    page_title="Fragment Match Explorer",
+    page_icon="🔬",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-def load_config():
-    """Load configuration from environment variables."""
-    load_dotenv()
-
-    base_path = os.getenv('BASE_PATH')
-    if not base_path:
-        raise ValueError("BASE_PATH not found in .env file")
-
-    model_type = os.getenv('MODEL_TYPE', 'default')
-
-    config = {
-        'base_path': base_path,
-        'model_type': model_type,
-        'db_path': os.path.join(base_path, f"OUTPUT_{model_type}", os.getenv('DB_NAME', 'matches.db')),
-        'image_base_path': os.path.join(base_path, f"OUTPUT_{model_type}", os.getenv('PATCHES_DIR', 'patches')),
+# Custom CSS for better styling
+st.markdown("""
+<style>
+    .main {
+        padding-top: 2rem;
     }
-
-    return config
-
-
-def get_top_matches_by_homography(db_path: str, limit: int = 10, max_error: float = 10.0) -> List[Tuple]:
-    """
-    Retrieve top matches from database sorted by homography error (lowest first).
-
-    Args:
-        db_path: Path to SQLite database
-        limit: Number of top matches to retrieve
-        max_error: Maximum homography error threshold
-
-    Returns:
-        List of tuples: (file1, file2, match_count, mean_homo_err, std_homo_err, is_validated)
-    """
-    matches = []
-
-    with sqlite3.connect(db_path) as conn:
-        # Check if homography_errors table exists
-        cursor = conn.execute("""
-            SELECT name FROM sqlite_master 
-            WHERE type='table' AND name='homography_errors'
-        """)
-
-        if not cursor.fetchone():
-            print("Warning: homography_errors table not found. Run homography computation first.")
-            print("Falling back to match count ordering...")
-
-            # Fallback to match count
-            cursor = conn.execute("""
-                SELECT file1, file2, match_count, -1, -1, is_validated
-                FROM matches 
-                WHERE match_count > 0
-                ORDER BY match_count DESC 
-                LIMIT ?
-            """, (limit,))
-        else:
-            # Query with homography errors
-            cursor = conn.execute("""
-                SELECT 
-                    m.file1, 
-                    m.file2, 
-                    m.match_count,
-                    h.mean_homo_err,
-                    h.std_homo_err,
-                    m.is_validated
-                FROM matches m
-                INNER JOIN homography_errors h ON m.id = h.match_id
-                WHERE h.mean_homo_err > 0 
-                    AND h.mean_homo_err <= ?
-                ORDER BY h.mean_homo_err ASC
-                LIMIT ?
-            """, (max_error, limit))
-
-        for row in cursor:
-            matches.append(row)
-
-    return matches
-
-
-def find_image_path(base_path: str, filename: str) -> Optional[str]:
-    """
-    Find the full path to an image file in the patches directory.
-
-    Args:
-        base_path: Base directory containing patches
-        filename: Image filename to find
-
-    Returns:
-        Full path to image file or None if not found
-    """
-    # Try to construct path based on filename pattern (e.g., PHerc-1691-Fr-3_45.jpg)
-    parts = filename.split('-')
-    if len(parts) >= 3:
-        # Expected pattern: PHerc-XXXX-Fr-Y_Z.jpg
-        subdir = '-'.join(parts[:3]).split('_')[0]
-        potential_path = os.path.join(base_path, subdir, filename)
-        if os.path.exists(potential_path):
-            return potential_path
-
-    # Fallback: search recursively
-    for root, dirs, files in os.walk(base_path):
-        if filename in files:
-            return os.path.join(root, filename)
-
-    return None
-
-
-def load_and_resize_image(image_path: str, max_size: int = 500) -> np.ndarray:
-    """
-    Load and resize image for display.
-
-    Args:
-        image_path: Path to image file
-        max_size: Maximum dimension for display
-
-    Returns:
-        Resized image array (RGB)
-    """
-    img = cv2.imread(image_path)
-    if img is None:
-        # Create placeholder image
-        img = np.ones((max_size, max_size, 3), dtype=np.uint8) * 200
-        cv2.putText(img, "Image not found", (10, max_size//2),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
-        return img
-
-    # Convert BGR to RGB
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-    # Resize if needed
-    height, width = img.shape[:2]
-    if max(height, width) > max_size:
-        scale = max_size / max(height, width)
-        new_width = int(width * scale)
-        new_height = int(height * scale)
-        img = cv2.resize(img, (new_width, new_height), interpolation=cv2.INTER_AREA)
-
-    return img
-
-
-def get_quality_color(homo_err: float) -> str:
-    """
-    Get color based on homography error quality.
-
-    Args:
-        homo_err: Mean homography error
-
-    Returns:
-        Color string for matplotlib
-    """
-    if homo_err < 0:
-        return 'gray'  # No homography data
-    elif homo_err <= 2.0:
-        return 'darkgreen'  # Excellent
-    elif homo_err <= 5.0:
-        return 'green'  # Good
-    elif homo_err <= 10.0:
-        return 'orange'  # Fair
-    else:
-        return 'red'  # Poor
-
-
-def plot_top_matches_by_homography(config: dict, num_matches: int = 10,
-                                   max_error: float = 10.0, save_path: str = None):
-    """
-    Create visualization of top fragment matches sorted by homography error.
-
-    Args:
-        config: Configuration dictionary
-        num_matches: Number of top matches to display
-        max_error: Maximum acceptable homography error
-        save_path: Optional path to save the figure
-    """
-    print(f"Loading top {num_matches} matches with best homography errors...")
-    print(f"Maximum error threshold: {max_error} pixels")
-
-    # Get top matches from database
-    matches = get_top_matches_by_homography(config['db_path'], limit=num_matches, max_error=max_error)
-
-    if not matches:
-        print("No matches found in database with homography errors!")
-        print("Please run the homography error computation first.")
-        return
-
-    print(f"Found {len(matches)} matches. Creating visualization...")
-
-    # Calculate grid dimensions
-    n_rows = min(num_matches, len(matches))
-
-    # Create figure with subplots
-    fig = plt.figure(figsize=(14, 3.5 * n_rows))
-    gs = GridSpec(n_rows, 2, figure=fig, hspace=0.3, wspace=0.1)
-
-    # Set main title
-    fig.suptitle(f'Top {n_rows} Fragment Matches by Homography Error (Best Geometric Consistency)',
-                 fontsize=16, fontweight='bold', y=1.02)
-
-    # Process each match
-    for idx, (file1, file2, match_count, mean_homo_err, std_homo_err, is_validated) in enumerate(matches[:num_matches]):
-        print(f"Processing match {idx+1}/{n_rows}: {file1} <-> {file2}")
-        print(f"  Homography error: {mean_homo_err:.2f} ± {std_homo_err:.2f} pixels ({match_count} matches)")
-
-        # Find full paths to images
-        path1 = find_image_path(config['image_base_path'], file1)
-        path2 = find_image_path(config['image_base_path'], file2)
-
-        if not path1:
-            print(f"  Warning: Could not find {file1}")
-        if not path2:
-            print(f"  Warning: Could not find {file2}")
-
-        # Load and resize images
-        img1 = load_and_resize_image(path1) if path1 else load_and_resize_image("")
-        img2 = load_and_resize_image(path2) if path2 else load_and_resize_image("")
-
-        # Create subplot for this match pair
-        ax1 = fig.add_subplot(gs[idx, 0])
-        ax2 = fig.add_subplot(gs[idx, 1])
-
-        # Display images
-        ax1.imshow(img1)
-        ax2.imshow(img2)
-
-        # Get quality color based on error
-        quality_color = get_quality_color(mean_homo_err)
-
-        # Set titles with homography error info
-        if mean_homo_err > 0:
-            ax1.set_title(f"{file1}\nError: {mean_homo_err:.2f}±{std_homo_err:.2f}px | {match_count} matches",
-                         fontsize=9, color=quality_color)
-
-            # Quality label
-            if mean_homo_err <= 2.0:
-                quality_label = "Excellent Match"
-            elif mean_homo_err <= 5.0:
-                quality_label = "Good Match"
-            elif mean_homo_err <= 10.0:
-                quality_label = "Fair Match"
-            else:
-                quality_label = "Poor Match"
-        else:
-            ax1.set_title(f"{file1}\n{match_count} matches (no homography)",
-                         fontsize=9, color='gray')
-            quality_label = "No Homography"
-
-        ax2.set_title(f"{file2}\n{quality_label} {'✓ Validated' if is_validated else ''}",
-                     fontsize=9, color='green' if is_validated else quality_color)
-
-        ax1.axis('off')
-        ax2.axis('off')
-
-        # Add match rank with color coding
-        rank_color = 'white' if mean_homo_err <= 5.0 else 'yellow'
-        ax1.text(0.02, 0.98, f"#{idx+1}", transform=ax1.transAxes,
-                fontsize=14, fontweight='bold', color='black',
-                verticalalignment='top',
-                bbox=dict(boxstyle='round', facecolor=rank_color, alpha=0.9))
-
-        # Add homography error badge
-        if mean_homo_err > 0:
-            ax2.text(0.98, 0.98, f"{mean_homo_err:.1f}px", transform=ax2.transAxes,
-                    fontsize=12, fontweight='bold', color='white',
-                    verticalalignment='top', horizontalalignment='right',
-                    bbox=dict(boxstyle='round', facecolor=quality_color, alpha=0.9))
-
-        # Add border based on quality
-        border_width = 3 if mean_homo_err <= 5.0 else 2
-        rect1 = patches.Rectangle((0, 0), img1.shape[1]-1, img1.shape[0]-1,
-                                 linewidth=border_width, edgecolor=quality_color, facecolor='none')
-        rect2 = patches.Rectangle((0, 0), img2.shape[1]-1, img2.shape[0]-1,
-                                 linewidth=border_width, edgecolor=quality_color, facecolor='none')
-        ax1.add_patch(rect1)
-        ax2.add_patch(rect2)
-
-        # Special marker for validated matches
-        if is_validated:
-            ax1.text(0.98, 0.02, "✓", transform=ax1.transAxes,
-                    fontsize=20, fontweight='bold', color='green',
-                    verticalalignment='bottom', horizontalalignment='right',
-                    bbox=dict(boxstyle='circle', facecolor='white', alpha=0.8))
-
-    plt.tight_layout()
-
-    # Add legend
-    legend_elements = [
-        patches.Patch(color='darkgreen', label='Excellent (≤2px)'),
-        patches.Patch(color='green', label='Good (2-5px)'),
-        patches.Patch(color='orange', label='Fair (5-10px)'),
-        patches.Patch(color='red', label='Poor (>10px)'),
-    ]
-    fig.legend(handles=legend_elements, loc='lower center', ncol=4,
-              bbox_to_anchor=(0.5, -0.02), fontsize=10)
-
-    # Save or show the figure
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"Visualization saved to: {save_path}")
-
-    plt.show()
-
-    # Print summary statistics
-    print("\n" + "="*60)
-    print("HOMOGRAPHY-BASED MATCH SUMMARY")
-    print("="*60)
-
-    valid_matches = [m for m in matches[:num_matches] if m[3] > 0]
-
-    if valid_matches:
-        validated_count = sum(1 for m in valid_matches if m[5])
-        avg_error = np.mean([m[3] for m in valid_matches])
-        min_error = min(m[3] for m in valid_matches)
-        max_error_actual = max(m[3] for m in valid_matches)
-
-        print(f"Matches with homography: {len(valid_matches)}/{min(num_matches, len(matches))}")
-        print(f"Validated matches: {validated_count}/{len(valid_matches)}")
-        print(f"Average homography error: {avg_error:.2f} pixels")
-        print(f"Best homography error: {min_error:.2f} pixels")
-        print(f"Worst displayed error: {max_error_actual:.2f} pixels")
-
-        # Quality distribution
-        excellent = sum(1 for m in valid_matches if m[3] <= 2.0)
-        good = sum(1 for m in valid_matches if 2.0 < m[3] <= 5.0)
-        fair = sum(1 for m in valid_matches if 5.0 < m[3] <= 10.0)
-
-        print(f"\nQuality Distribution:")
-        print(f"  Excellent (≤2px): {excellent}")
-        print(f"  Good (2-5px): {good}")
-        print(f"  Fair (5-10px): {fair}")
-    else:
-        print("No matches with homography data found!")
-
-    print("="*60)
-
-
-def plot_comparison_view(config: dict, num_matches: int = 5, max_error: float = 10.0, save_path: str = None):
-    """
-    Create a comparison view showing matches sorted by both match count and homography error.
-
-    Args:
-        config: Configuration dictionary
-        num_matches: Number of top matches to display for each metric
-        max_error: Maximum acceptable homography error
-        save_path: Optional path to save the figure
-    """
-    print("Creating comparison view: Match Count vs Homography Error...")
-
-    # Get top matches by homography error
-    matches_by_homo = get_top_matches_by_homography(config['db_path'], limit=num_matches, max_error=max_error)
-
-    # Get top matches by match count (fallback query)
-    with sqlite3.connect(config['db_path']) as conn:
-        cursor = conn.execute("""
-            SELECT file1, file2, match_count, -1, -1, is_validated
-            FROM matches 
-            WHERE match_count > 0
-            ORDER BY match_count DESC 
-            LIMIT ?
-        """, (num_matches,))
-        matches_by_count = list(cursor.fetchall())
-
-    # Create figure with two columns
-    fig = plt.figure(figsize=(16, 3 * num_matches))
-
-    fig.suptitle('Fragment Match Comparison: Match Count vs Homography Error',
-                fontsize=16, fontweight='bold')
-
-    # Plot matches by count (left column)
-    for idx, (file1, file2, match_count, _, _, is_validated) in enumerate(matches_by_count):
-        ax = plt.subplot(num_matches, 4, idx * 4 + 1)
-        path1 = find_image_path(config['image_base_path'], file1)
-        if path1:
-            img1 = load_and_resize_image(path1)
-            ax.imshow(img1)
-        ax.set_title(f"By Count #{idx+1}\n{file1}\n{match_count} matches", fontsize=8)
-        ax.axis('off')
-
-        ax = plt.subplot(num_matches, 4, idx * 4 + 2)
-        path2 = find_image_path(config['image_base_path'], file2)
-        if path2:
-            img2 = load_and_resize_image(path2)
-            ax.imshow(img2)
-        ax.set_title(f"{file2}\n{'✓' if is_validated else ''}", fontsize=8)
-        ax.axis('off')
-
-    # Plot matches by homography (right column)
-    for idx, match in enumerate(matches_by_homo):
-        if idx < len(matches_by_homo):
-            file1, file2, match_count, mean_homo_err, std_homo_err, is_validated = match
-
-            ax = plt.subplot(num_matches, 4, idx * 4 + 3)
-            path1 = find_image_path(config['image_base_path'], file1)
-            if path1:
-                img1 = load_and_resize_image(path1)
-                ax.imshow(img1)
-
-            color = get_quality_color(mean_homo_err)
-            ax.set_title(f"By Homo #{idx+1}\n{file1}\n{mean_homo_err:.2f}±{std_homo_err:.2f}px",
-                        fontsize=8, color=color)
-            ax.axis('off')
-
-            ax = plt.subplot(num_matches, 4, idx * 4 + 4)
-            path2 = find_image_path(config['image_base_path'], file2)
-            if path2:
-                img2 = load_and_resize_image(path2)
-                ax.imshow(img2)
-            ax.set_title(f"{file2}\n{match_count} matches {'✓' if is_validated else ''}",
-                        fontsize=8, color=color)
-            ax.axis('off')
-
-    plt.tight_layout()
-
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"Comparison view saved to: {save_path}")
-
-    plt.show()
+    .stButton>button {
+        width: 100%;
+        background-color: #0066cc;
+        color: white;
+    }
+    .match-info {
+        background-color: #f0f2f6;
+        padding: 20px;
+        border-radius: 10px;
+        margin: 10px 0;
+    }
+    .metric-card {
+        background-color: white;
+        padding: 15px;
+        border-radius: 8px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    h1 {
+        color: #1f2937;
+        font-weight: 700;
+    }
+    .good-match {
+        background-color: #10b981;
+        color: white;
+        padding: 3px 8px;
+        border-radius: 4px;
+    }
+    .bad-match {
+        background-color: #ef4444;
+        color: white;
+        padding: 3px 8px;
+        border-radius: 4px;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+
+@st.cache_resource
+def get_database_connection(db_path):
+    """Create a cached database connection."""
+    return sqlite3.connect(db_path, check_same_thread=False)
+
+
+class FragmentMatchViewer:
+    """Interactive viewer for fragment matching results with homography focus."""
+
+    def __init__(self, db_path: str, image_base_path: str):
+        """Initialize the viewer with database and image paths."""
+        self.db_path = db_path
+        self.image_base_path = image_base_path
+        self.conn = None
+        self.current_matches = None
+
+    def connect_db(self):
+        """Connect to the SQLite database."""
+        try:
+            self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            return True
+        except Exception as e:
+            st.error(f"Failed to connect to database: {e}")
+            return False
+
+    def get_statistics(self) -> Dict:
+        """Get overall statistics from the database."""
+        if not self.conn:
+            return {}
+
+        try:
+            # Get match statistics with homography focus
+            query = """
+            SELECT 
+                COUNT(*) as total_matches,
+                COUNT(CASE WHEN h.is_valid = 1 THEN 1 END) as valid_homography,
+                COUNT(CASE WHEN h.mean_homo_err < 5 THEN 1 END) as excellent_matches,
+                COUNT(CASE WHEN h.mean_homo_err BETWEEN 5 AND 10 THEN 1 END) as good_matches,
+                COUNT(CASE WHEN h.mean_homo_err > 10 THEN 1 END) as poor_matches,
+                AVG(m.match_count) as avg_match_count,
+                AVG(CASE WHEN h.is_valid = 1 THEN h.mean_homo_err END) as avg_homo_error,
+                MIN(CASE WHEN h.is_valid = 1 THEN h.mean_homo_err END) as min_homo_error,
+                MAX(CASE WHEN h.is_valid = 1 THEN h.mean_homo_err END) as max_homo_error
+            FROM matches m
+            LEFT JOIN homography_errors h ON m.id = h.match_id
+            """
+
+            df = pd.read_sql_query(query, self.conn)
+            return df.iloc[0].to_dict()
+        except Exception as e:
+            st.error(f"Error fetching statistics: {e}")
+            return {}
+
+    def get_matches(self, sort_by: str = 'homo_error_asc', min_matches: int = 10,
+                    max_error: float = 100.0, min_error: float = 0.0,
+                    limit: int = 100, validated_only: bool = False,
+                    valid_homo_only: bool = False) -> pd.DataFrame:
+        """Retrieve matches from database with advanced filtering and sorting."""
+        if not self.conn:
+            return pd.DataFrame()
+
+        try:
+            query = """
+            SELECT 
+                m.id,
+                m.file1,
+                m.file2,
+                m.match_count,
+                m.is_validated,
+                h.mean_homo_err,
+                h.std_homo_err,
+                h.max_homo_err,
+                h.min_homo_err,
+                h.median_homo_err,
+                h.is_valid as homo_valid,
+                h.len_homo_err as num_inliers
+            FROM matches m
+            LEFT JOIN homography_errors h ON m.id = h.match_id
+            WHERE m.match_count >= ?
+            """
+
+            params = [min_matches]
+
+            if validated_only:
+                query += " AND m.is_validated = 1"
+
+            if valid_homo_only:
+                query += " AND h.is_valid = 1"
+
+            # Add homography error range filter
+            query += " AND (h.mean_homo_err IS NULL OR (h.mean_homo_err >= ? AND h.mean_homo_err <= ?))"
+            params.extend([min_error, max_error])
+
+            # Add sorting based on selection
+            if sort_by == 'homo_error_asc':
+                query += " ORDER BY CASE WHEN h.mean_homo_err IS NULL THEN 999999 ELSE h.mean_homo_err END ASC"
+            elif sort_by == 'homo_error_desc':
+                query += " ORDER BY h.mean_homo_err DESC NULLS LAST"
+            elif sort_by == 'match_count_desc':
+                query += " ORDER BY m.match_count DESC"
+            elif sort_by == 'match_count_asc':
+                query += " ORDER BY m.match_count ASC"
+            elif sort_by == 'std_error_asc':
+                query += " ORDER BY CASE WHEN h.std_homo_err IS NULL THEN 999999 ELSE h.std_homo_err END ASC"
+            elif sort_by == 'validated_first':
+                query += " ORDER BY m.is_validated DESC, h.mean_homo_err ASC"
+
+            query += " LIMIT ?"
+            params.append(limit)
+
+            df = pd.read_sql_query(query, self.conn, params=params)
+
+            # Add quality category column
+            def categorize_quality(row):
+                if pd.isna(row['mean_homo_err']):
+                    return 'No Homography'
+                elif row['mean_homo_err'] < 5:
+                    return 'Excellent'
+                elif row['mean_homo_err'] < 10:
+                    return 'Good'
+                elif row['mean_homo_err'] < 20:
+                    return 'Fair'
+                else:
+                    return 'Poor'
+
+            df['quality'] = df.apply(categorize_quality, axis=1)
+
+            return df
+        except Exception as e:
+            st.error(f"Error fetching matches: {e}")
+            return pd.DataFrame()
+
+    def get_match_details(self, match_id: int) -> Optional[bytes]:
+        """Get detailed match data for a specific match."""
+        if not self.conn:
+            return None
+
+        try:
+            cursor = self.conn.execute(
+                "SELECT matches_data FROM matches WHERE id = ?",
+                (match_id,)
+            )
+            result = cursor.fetchone()
+            return result[0] if result else None
+        except Exception as e:
+            st.error(f"Error fetching match details: {e}")
+            return None
+
+    def get_all_matches_for_fragment(self, fragment_name: str, min_matches: int = 10,
+                                     min_error: float = 0.0, max_error: float = 100.0,
+                                     exclude_fragment: str = None) -> pd.DataFrame:
+        """Get all matches for a specific fragment sorted by homography error with filters."""
+        if not self.conn:
+            return pd.DataFrame()
+
+        try:
+            query = """
+            SELECT 
+                m.id,
+                m.file1,
+                m.file2,
+                m.match_count,
+                m.is_validated,
+                h.mean_homo_err,
+                h.std_homo_err,
+                h.is_valid as homo_valid,
+                CASE 
+                    WHEN m.file1 = ? THEN m.file2
+                    ELSE m.file1
+                END as matched_fragment
+            FROM matches m
+            LEFT JOIN homography_errors h ON m.id = h.match_id
+            WHERE (m.file1 = ? OR m.file2 = ?)
+                AND m.match_count >= ?
+                AND h.mean_homo_err IS NOT NULL
+                AND h.mean_homo_err >= ?
+                AND h.mean_homo_err <= ?
+                AND h.mean_homo_err != -1
+            """
+
+            params = [fragment_name, fragment_name, fragment_name, min_matches, min_error, max_error]
+
+            # Exclude the other fragment from the current pair if specified
+            if exclude_fragment:
+                query += """
+                AND CASE 
+                    WHEN m.file1 = ? THEN m.file2
+                    ELSE m.file1
+                END != ?
+                """
+                params.extend([fragment_name, exclude_fragment])
+
+            query += " ORDER BY h.mean_homo_err ASC"
+
+            df = pd.read_sql_query(query, self.conn, params=params)
+
+            # Add quality category
+            def categorize_quality(row):
+                if pd.isna(row['mean_homo_err']):
+                    return 'No Homography'
+                elif row['mean_homo_err'] < 5:
+                    return 'Excellent'
+                elif row['mean_homo_err'] < 10:
+                    return 'Good'
+                elif row['mean_homo_err'] < 20:
+                    return 'Fair'
+                else:
+                    return 'Poor'
+
+            df['quality'] = df.apply(categorize_quality, axis=1)
+            return df
+        except Exception as e:
+            st.error(f"Error fetching matches for fragment: {e}")
+            return pd.DataFrame()
+
+    def construct_image_path(self, filename: str) -> str:
+        """Construct full image path from filename."""
+        # Extract folder structure from filename pattern
+        # Assuming format: XXX-YYY-ZZZ_N.jpg where folder is XXX-YYY-ZZZ
+        parts = filename.split('-')
+        if len(parts) >= 3:
+            folder = '-'.join(parts[:3]).split('_')[0]
+            return os.path.join(self.image_base_path, folder, filename)
+        return os.path.join(self.image_base_path, filename)
+
+    def load_image(self, filepath: str) -> Optional[np.ndarray]:
+        """Load and return image."""
+        if not os.path.exists(filepath):
+            # Try without folder structure
+            filepath = os.path.join(self.image_base_path, os.path.basename(filepath))
+
+        if os.path.exists(filepath):
+            img = cv2.imread(filepath)
+            if img is not None:
+                return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        return None
+
+    def visualize_matches_with_lines(self, img1: np.ndarray, img2: np.ndarray,
+                                     matches_data: bytes) -> np.ndarray:
+        """Create visualization with match lines between images."""
+        try:
+            # Deserialize match data
+            matches = pickle.loads(matches_data)
+
+            if not matches:
+                return np.hstack([img1, img2])
+
+            # Create side-by-side visualization
+            h1, w1 = img1.shape[:2]
+            h2, w2 = img2.shape[:2]
+
+            # Create output image
+            height = max(h1, h2)
+            width = w1 + w2
+            output = np.zeros((height, width, 3), dtype=np.uint8)
+
+            # Place images
+            output[:h1, :w1] = img1
+            output[:h2, w1:] = img2
+
+            # Draw sample connection lines (in production, use actual keypoint data)
+            num_lines_to_draw = min(50, len(matches))  # Limit lines for clarity
+
+            # Sample random matches to visualize
+            import random
+            sample_matches = random.sample(matches, num_lines_to_draw) if len(matches) > num_lines_to_draw else matches
+
+            # Draw lines (simplified - would need actual keypoint positions)
+            for i, match in enumerate(sample_matches):
+                # Generate pseudo-random positions for demo
+                # In production, use actual keypoint positions
+                color = (0, 255, 0) if i < num_lines_to_draw // 2 else (0, 255, 255)
+                thickness = 1
+
+                # This is placeholder - replace with actual keypoint coordinates
+                y_offset = int((i / num_lines_to_draw) * min(h1, h2))
+                cv2.line(output,
+                         (w1 - 1, y_offset),
+                         (w1 + 1, y_offset),
+                         color, thickness)
+
+            # Add text overlay
+            cv2.putText(output, f"Total: {len(matches)} matches",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+
+            return output
+
+        except Exception as e:
+            st.error(f"Error visualizing matches: {e}")
+            return np.hstack([img1, img2])
 
 
 def main():
-    """Main execution function."""
-    import argparse
+    """Main application function."""
 
-    parser = argparse.ArgumentParser(
-        description="Visualize top fragment matches sorted by homography error (geometric consistency)"
-    )
+    # Title and description
+    st.title("🔬 Fragment Match Explorer")
+    st.markdown("### Advanced visualization and analysis of fragment matches")
 
-    parser.add_argument(
-        "--num-matches",
-        type=int,
-        default=10,
-        help="Number of top matches to display (default: 10)"
-    )
+    # Sidebar configuration
+    with st.sidebar:
+        st.header("⚙️ Configuration")
 
-    parser.add_argument(
-        "--max-error",
-        type=float,
-        default=10.0,
-        help="Maximum homography error in pixels (default: 10.0)"
-    )
+        # Database and image path inputs
+        db_path = st.text_input(
+            "Database Path",
+            value="/Users/assafspanier/Dropbox/YamHamelach_data_n_model/OUTPUT_faster_rcnn/matches.db",
+            help="Path to the SQLite database with match results"
+        )
 
-    parser.add_argument(
-        "--save",
-        type=str,
-        help="Path to save the visualization (optional)"
-    )
+        image_base_path = st.text_input(
+            "Image Base Path",
+            value="/Users/assafspanier/Dropbox/YamHamelach_data_n_model/OUTPUT_faster_rcnn/output_patches",
+            help="Base directory containing fragment images"
+        )
 
-    parser.add_argument(
-        "--comparison",
-        action="store_true",
-        help="Show comparison view (match count vs homography error)"
-    )
+        complete_image_path = st.text_input(
+            "Complete Image Path",
+            value="/Users/assafspanier/Dropbox/YamHamelach_data_n_model/OUTPUT_faster_rcnn/output_bbox",
+            help="Base directory containing complete images (without fragment suffixes)"
+        )
 
-    parser.add_argument(
-        "--config",
-        help="Path to .env configuration file"
-    )
+        if st.button("🔌 Connect", type="primary"):
+            conn = get_database_connection(db_path)
+            st.session_state.viewer = FragmentMatchViewer(db_path, image_base_path)
+            st.session_state.viewer.conn = conn
+            st.session_state.complete_image_path = complete_image_path
+            st.session_state.connected = True
+            if conn:
+                st.success("✅ Connected successfully!")
+                st.session_state.connected = True
+            else:
+                st.session_state.connected = False
 
-    args = parser.parse_args()
+    # Check if viewer is initialized
+    if 'viewer' not in st.session_state or not st.session_state.get('connected', False):
+        st.info("👈 Please configure database and image paths in the sidebar")
+        return
 
-    # Load configuration
-    if args.config:
-        load_dotenv(args.config)
+    viewer = st.session_state.viewer
 
-    try:
-        config = load_config()
+    # Display statistics
+    stats = viewer.get_statistics()
+    if stats:
+        st.header("📊 Homography Quality Overview")
 
-        print("="*60)
-        print("FRAGMENT MATCH VISUALIZATION (HOMOGRAPHY-BASED)")
-        print("="*60)
-        print(f"Database: {config['db_path']}")
-        print(f"Image path: {config['image_base_path']}")
-        print(f"Displaying top {args.num_matches} matches")
-        print(f"Maximum error threshold: {args.max_error} pixels")
-        print("="*60)
+        col1, col2, col3, col4, col5 = st.columns(5)
 
-        if args.comparison:
-            plot_comparison_view(
-                config,
-                num_matches=min(args.num_matches, 5),
-                max_error=args.max_error,
-                save_path=args.save
+        with col1:
+            st.metric(
+                "Total Matches",
+                f"{int(stats.get('total_matches', 0)):,}"
             )
+
+        with col2:
+            excellent = int(stats.get('excellent_matches', 0))
+            st.metric(
+                "Excellent (<5px)",
+                f"{excellent:,}",
+                delta=f"{excellent / stats.get('total_matches', 1) * 100:.1f}%"
+            )
+
+        with col3:
+            good = int(stats.get('good_matches', 0))
+            st.metric(
+                "Good (5-10px)",
+                f"{good:,}",
+                delta=f"{good / stats.get('total_matches', 1) * 100:.1f}%"
+            )
+
+        with col4:
+            st.metric(
+                "Avg Error",
+                f"{stats.get('avg_homo_error', 0):.2f} px"
+            )
+
+        with col5:
+            st.metric(
+                "Min Error",
+                f"{stats.get('min_homo_error', 0):.2f} px"
+            )
+
+    st.divider()
+
+    # Create tabs for different views
+    tab1, tab2, tab3 = st.tabs([
+        "📊 Table View & Images",
+        "📈 Analytics",
+        "📉 Error Distribution"
+    ])
+
+    with tab1:
+        # Filter controls
+        st.header("Filter & Sort Matches")
+
+        col1, col2, col3, col4 = st.columns(4)
+
+        with col1:
+            sort_by = st.selectbox(
+                "Sort By",
+                options=[
+                    ('homo_error_asc', '📈 Homography Error (Best First)'),
+                    ('homo_error_desc', '📉 Homography Error (Worst First)'),
+                    ('std_error_asc', '📊 Std Deviation (Most Stable)'),
+                    ('match_count_desc', '🔢 Match Count (High to Low)'),
+                    ('match_count_asc', '🔢 Match Count (Low to High)'),
+                    ('validated_first', '✅ Validated First')
+                ],
+                format_func=lambda x: x[1],
+                index=0  # Default to homography error ascending
+            )[0]
+
+        with col2:
+            # Homography error range slider
+            error_range = st.slider(
+                "Homography Error Range (px)",
+                min_value=0.0,
+                max_value=300.0,
+                value=(0.0, 200.0),
+                step=0.5,
+                help="Filter matches by homography error range"
+            )
+            min_error, max_error = error_range
+
+        with col3:
+            min_matches = st.number_input(
+                "Min Match Count",
+                min_value=1,
+                max_value=500,
+                value=10,
+                step=5,
+                help="Minimum number of SIFT matches"
+            )
+
+        with col4:
+            limit = st.number_input(
+                "Result Limit",
+                min_value=10,
+                max_value=2000,
+                value=1000,
+                step=10
+            )
+
+        # Additional filters
+        col1, col2 = st.columns(2)
+        with col1:
+            validated_only = st.checkbox("Show validated matches only")
+        with col2:
+            valid_homo_only = st.checkbox("Show valid homography only")
+
+        # Load matches
+        if st.button("🔄 Apply Filters", type="primary"):
+            with st.spinner("Loading matches..."):
+                matches_df = viewer.get_matches(
+                    sort_by=sort_by,
+                    min_matches=min_matches,
+                    min_error=min_error,
+                    max_error=max_error,
+                    limit=limit,
+                    validated_only=validated_only,
+                    valid_homo_only=valid_homo_only
+                )
+                st.session_state.matches_df = matches_df
+
+        # Display matches if loaded
+        if 'matches_df' in st.session_state and not st.session_state.matches_df.empty:
+            matches_df = st.session_state.matches_df
+
+            st.header(f"📋 Found {len(matches_df)} Matches")
+
+            # Display quality distribution
+            if 'quality' in matches_df.columns:
+                quality_counts = matches_df['quality'].value_counts()
+                st.markdown("**Quality Distribution:**")
+                quality_cols = st.columns(len(quality_counts))
+                for i, (quality, count) in enumerate(quality_counts.items()):
+                    with quality_cols[i]:
+                        color = {'Excellent': '🟢', 'Good': '🟡', 'Fair': '🟠', 'Poor': '🔴', 'No Homography': '⚫'}.get(
+                            quality, '⚪')
+                        st.metric(f"{color} {quality}", count)
+
+            # Interactive table with color coding
+            def highlight_quality(row):
+                if pd.isna(row['mean_homo_err']):
+                    return ['background-color: #gray'] * len(row)
+                elif row['mean_homo_err'] < 5:
+                    return ['background-color: #d4f4dd'] * len(row)
+                elif row['mean_homo_err'] < 10:
+                    return ['background-color: #fff3cd'] * len(row)
+                elif row['mean_homo_err'] < 20:
+                    return ['background-color: #ffe5cc'] * len(row)
+                else:
+                    return ['background-color: #ffcccc'] * len(row)
+
+            display_df = matches_df[['file1', 'file2', 'match_count', 'mean_homo_err',
+                                     'std_homo_err', 'num_inliers', 'quality', 'is_validated']]
+
+            styled_df = display_df.style.apply(highlight_quality, axis=1)
+            st.dataframe(
+                styled_df,
+                use_container_width=True,
+                hide_index=True
+            )
+
+            st.divider()
+
+            # Select a match to visualize
+            st.subheader("Select a Match to Visualize")
+            selected_idx = st.selectbox(
+                "Choose match",
+                options=matches_df.index,
+                format_func=lambda
+                    x: f"Rank {x + 1}: {matches_df.loc[x, 'file1'][:20]}... ↔ {matches_df.loc[x, 'file2'][:20]}... (Error: {matches_df.loc[x, 'mean_homo_err']:.2f}px)" if pd.notna(
+                    matches_df.loc[x, 'mean_homo_err']) else f"Rank {x + 1}: No homography"
+            )
+
+            if selected_idx is not None:
+                selected_match = matches_df.loc[selected_idx]
+
+                # Display detailed match metrics
+                st.markdown("### 📐 Homography Metrics")
+
+                col1, col2, col3, col4 = st.columns(4)
+
+                with col1:
+                    if pd.notna(selected_match['mean_homo_err']):
+                        st.metric(
+                            "Mean Error",
+                            f"{selected_match['mean_homo_err']:.2f} px",
+                            delta="Good" if selected_match['mean_homo_err'] < 10 else "Poor"
+                        )
+                    else:
+                        st.metric("Mean Error", "N/A")
+
+                with col2:
+                    if pd.notna(selected_match['std_homo_err']):
+                        st.metric(
+                            "Std Deviation",
+                            f"{selected_match['std_homo_err']:.2f} px"
+                        )
+                    else:
+                        st.metric("Std Deviation", "N/A")
+
+                with col3:
+                    if pd.notna(selected_match['min_homo_err']) and pd.notna(selected_match['max_homo_err']):
+                        st.metric(
+                            "Error Range",
+                            f"{selected_match['min_homo_err']:.1f} - {selected_match['max_homo_err']:.1f} px"
+                        )
+                    else:
+                        st.metric("Error Range", "N/A")
+
+                with col4:
+                    st.metric(
+                        "Match Count",
+                        f"{selected_match['match_count']}",
+                        delta=f"{selected_match.get('num_inliers', 'N/A')} inliers"
+                    )
+
+                # Image comparison directly below selection
+                st.markdown("### 🖼️ Fragment Comparison")
+
+                if selected_match['is_validated']:
+                    st.success("✅ This is a validated match")
+
+                # Quality indicator
+                quality = selected_match.get('quality', 'Unknown')
+                quality_color = {'Excellent': '#10b981', 'Good': '#fbbf24', 'Fair': '#fb923c', 'Poor': '#ef4444'}.get(
+                    quality, '#gray')
+                st.markdown(
+                    f"<div style='background-color: {quality_color}; color: white; padding: 10px; border-radius: 5px; text-align: center; margin-bottom: 20px;'>Quality: {quality}</div>",
+                    unsafe_allow_html=True)
+
+                # Load and display images
+                path1 = viewer.construct_image_path(selected_match['file1'])
+                path2 = viewer.construct_image_path(selected_match['file2'])
+
+                img1 = viewer.load_image(path1)
+                img2 = viewer.load_image(path2)
+
+                if img1 is not None and img2 is not None:
+                    col1, col2 = st.columns(2)
+
+                    with col1:
+                        st.image(img1, caption=f"Fragment 1: {selected_match['file1']}", use_container_width=True)
+
+                    with col2:
+                        st.image(img2, caption=f"Fragment 2: {selected_match['file2']}", use_container_width=True)
+
+                    # Show combined visualization
+                    if st.checkbox("Show match visualization with connection lines"):
+                        match_data = viewer.get_match_details(selected_match['id'])
+                        if match_data:
+                            combined = viewer.visualize_matches_with_lines(img1, img2, match_data)
+                            st.image(combined, caption="Match Visualization", use_container_width=True)
+                else:
+                    st.warning("⚠️ Could not load one or both images. Please check the image paths.")
+
+                # Button to see all matches for the selected fragments
+                st.divider()
+
+                # Create columns for better layout
+                col1, col2, col3 = st.columns([1, 1, 1])
+
+                with col1:
+                    # Button to show complete images
+                    if st.button("🖼️ Show complete images",
+                                 type="secondary",
+                                 use_container_width=True):
+                        st.session_state.show_complete_images = True
+                        st.session_state.complete_file1 = selected_match['file1']
+                        st.session_state.complete_file2 = selected_match['file2']
+
+                with col2:
+                    # Store selected match info in session state for the button
+                    if st.button("🔍 See all matches of these fragments",
+                                 type="primary",
+                                 use_container_width=True,
+                                 disabled=False):
+                        st.session_state.show_all_matches = True
+                        st.session_state.selected_file1 = selected_match['file1']
+                        st.session_state.selected_file2 = selected_match['file2']
+                        st.session_state.min_matches_for_all = min_matches
+                        st.session_state.min_error_for_all = min_error
+                        st.session_state.max_error_for_all = max_error
+
+                # Display complete images if button was clicked
+                if st.session_state.get('show_complete_images', False):
+                    st.divider()
+                    st.subheader("📸 Complete Images Containing These Fragments")
+
+                    # Extract base filenames without fragment numbers
+                    file1 = st.session_state.get('complete_file1', '')
+                    file2 = st.session_state.get('complete_file2', '')
+
+                    # Parse filenames to get base image names
+                    # Example: M43166-1-E_530.jpg -> M43166-1-E.jpg
+                    base_file1 = file1.rsplit('_', 1)[0] + '.jpg' if '_' in file1 else file1
+                    base_file2 = file2.rsplit('_', 1)[0] + '.jpg' if '_' in file2 else file2
+
+                    # Get complete image path from session state
+                    complete_path = st.session_state.get('complete_image_path', '')
+
+                    if complete_path:
+                        # Construct full paths for complete images
+                        complete_path1 = os.path.join(complete_path, base_file1)
+                        complete_path2 = os.path.join(complete_path, base_file2)
+
+                        # Load complete images
+                        complete_img1 = viewer.load_image(complete_path1)
+                        complete_img2 = viewer.load_image(complete_path2)
+
+                        col1, col2 = st.columns(2)
+
+                        with col1:
+                            if complete_img1 is not None:
+                                st.image(complete_img1,
+                                         caption=f"Complete Image: {base_file1}",
+                                         use_container_width=True)
+                                # Show which fragment this is
+                                fragment_num1 = file1.rsplit('_', 1)[1].replace('.jpg', '') if '_' in file1 else 'N/A'
+                                st.caption(f"Contains fragment #{fragment_num1}")
+                            else:
+                                st.warning(f"⚠️ Could not load complete image: {base_file1}")
+                                st.caption(f"Attempted path: {complete_path1}")
+
+                        with col2:
+                            if complete_img2 is not None:
+                                st.image(complete_img2,
+                                         caption=f"Complete Image: {base_file2}",
+                                         use_container_width=True)
+                                # Show which fragment this is
+                                fragment_num2 = file2.rsplit('_', 1)[1].replace('.jpg', '') if '_' in file2 else 'N/A'
+                                st.caption(f"Contains fragment #{fragment_num2}")
+                            else:
+                                st.warning(f"⚠️ Could not load complete image: {base_file2}")
+                                st.caption(f"Attempted path: {complete_path2}")
+
+                        # Add clear button for complete images
+                        if st.button("❌ Hide complete images", use_container_width=False):
+                            st.session_state.show_complete_images = False
+                            st.rerun()
+                    else:
+                        st.warning("⚠️ Complete image path not configured. Please set it in the sidebar.")
+
+                # Display all matches if button was clicked
+                if st.session_state.get('show_all_matches', False):
+                    st.divider()
+                    st.subheader("📋 Other Matches for Selected Fragments")
+
+                    # Get the stored parameters
+                    file1 = st.session_state.get('selected_file1', '')
+                    file2 = st.session_state.get('selected_file2', '')
+                    min_match_count = st.session_state.get('min_matches_for_all', 10)
+                    min_err = st.session_state.get('min_error_for_all', 0.0)
+                    max_err = st.session_state.get('max_error_for_all', 100.0)
+
+                    # Display filter criteria being used
+                    st.info(
+                        f"Showing other matches with: **{min_match_count}+ matches** | **Error range: {min_err:.1f} - {max_err:.1f} px** | Excluding current pair")
+
+                    # Create two columns for the two fragments
+                    col1, col2 = st.columns(2)
+
+                    with col1:
+                        st.markdown(f"### Other matches for: {file1}")
+
+                        # Get all matches for first fragment, excluding file2
+                        matches_file1 = viewer.get_all_matches_for_fragment(
+                            file1, min_match_count, min_err, max_err, exclude_fragment=file2
+                        )
+
+                        if not matches_file1.empty:
+                            st.markdown(f"Found **{len(matches_file1)}** other matches within criteria")
+
+                            # Display quality distribution
+                            quality_counts = matches_file1['quality'].value_counts()
+                            quality_text = " | ".join([f"{q}: {c}" for q, c in quality_counts.items()])
+                            st.caption(f"Quality: {quality_text}")
+
+                            # Display matches with thumbnails
+                            for idx, row in matches_file1.iterrows():
+                                error_text = f"{row['mean_homo_err']:.2f}px"
+                                quality_color = {
+                                    'Excellent': '🟢',
+                                    'Good': '🟡',
+                                    'Fair': '🟠',
+                                    'Poor': '🔴'
+                                }.get(row['quality'], '⚪')
+
+                                validated_badge = "✅" if row['is_validated'] else ""
+
+                                # Create container for each match
+                                with st.container():
+                                    # Match info
+                                    st.markdown(f"""
+                                    <div style='background-color: #f0f2f6; padding: 10px; margin: 5px 0; border-radius: 5px;'>
+                                        <strong>{quality_color} {row['matched_fragment']}</strong><br>
+                                        Error: {error_text} | Matches: {row['match_count']} {validated_badge}
+                                    </div>
+                                    """, unsafe_allow_html=True)
+
+                                    # Load and display thumbnail
+                                    matched_path = viewer.construct_image_path(row['matched_fragment'])
+                                    matched_img = viewer.load_image(matched_path)
+
+                                    if matched_img is not None:
+                                        # Create expandable image with unique key
+                                        with st.expander(f"View image", expanded=False):
+                                            st.image(matched_img, caption=row['matched_fragment'],
+                                                     use_container_width=True)
+
+                                    st.markdown("---")
+                        else:
+                            st.info(
+                                f"No other matches found within the specified criteria (Error: {min_err:.1f}-{max_err:.1f}px, Min matches: {min_match_count})")
+
+                    with col2:
+                        st.markdown(f"### Other matches for: {file2}")
+
+                        # Get all matches for second fragment, excluding file1
+                        matches_file2 = viewer.get_all_matches_for_fragment(
+                            file2, min_match_count, min_err, max_err, exclude_fragment=file1
+                        )
+
+                        if not matches_file2.empty:
+                            st.markdown(f"Found **{len(matches_file2)}** other matches within criteria")
+
+                            # Display quality distribution
+                            quality_counts = matches_file2['quality'].value_counts()
+                            quality_text = " | ".join([f"{q}: {c}" for q, c in quality_counts.items()])
+                            st.caption(f"Quality: {quality_text}")
+
+                            # Display matches with thumbnails
+                            for idx, row in matches_file2.iterrows():
+                                error_text = f"{row['mean_homo_err']:.2f}px"
+                                quality_color = {
+                                    'Excellent': '🟢',
+                                    'Good': '🟡',
+                                    'Fair': '🟠',
+                                    'Poor': '🔴'
+                                }.get(row['quality'], '⚪')
+
+                                validated_badge = "✅" if row['is_validated'] else ""
+
+                                # Create container for each match
+                                with st.container():
+                                    # Match info
+                                    st.markdown(f"""
+                                    <div style='background-color: #f0f2f6; padding: 10px; margin: 5px 0; border-radius: 5px;'>
+                                        <strong>{quality_color} {row['matched_fragment']}</strong><br>
+                                        Error: {error_text} | Matches: {row['match_count']} {validated_badge}
+                                    </div>
+                                    """, unsafe_allow_html=True)
+
+                                    # Load and display thumbnail
+                                    matched_path = viewer.construct_image_path(row['matched_fragment'])
+                                    matched_img = viewer.load_image(matched_path)
+
+                                    if matched_img is not None:
+                                        # Create expandable image with unique key
+                                        with st.expander(f"View image", expanded=False):
+                                            st.image(matched_img, caption=row['matched_fragment'],
+                                                     use_container_width=True)
+
+                                    st.markdown("---")
+                        else:
+                            st.info(
+                                f"No other matches found within the specified criteria (Error: {min_err:.1f}-{max_err:.1f}px, Min matches: {min_match_count})")
+
+                    # Add a clear button to hide the results
+                    st.divider()
+                    if st.button("❌ Clear all matches view", use_container_width=False):
+                        st.session_state.show_all_matches = False
+                        st.rerun()
+
+    with tab2:
+        # Analytics view
+        if 'matches_df' in st.session_state and not st.session_state.matches_df.empty:
+            matches_df = st.session_state.matches_df
+
+            st.subheader("Match Quality Analysis")
+
+            # Scatter plot: Match count vs Homography error
+            valid_errors = matches_df[matches_df['mean_homo_err'].notna()].copy()
+
+            if not valid_errors.empty:
+                # Main scatter plot
+                fig = px.scatter(
+                    valid_errors,
+                    x='match_count',
+                    y='mean_homo_err',
+                    color='quality',
+                    size='num_inliers',
+                    title="Match Count vs Homography Error",
+                    labels={
+                        'match_count': 'Number of SIFT Matches',
+                        'mean_homo_err': 'Mean Homography Error (pixels)',
+                        'quality': 'Quality Category',
+                        'num_inliers': 'Number of Inliers'
+                    },
+                    hover_data=['file1', 'file2', 'std_homo_err'],
+                    color_discrete_map={
+                        'Excellent': '#10b981',
+                        'Good': '#fbbf24',
+                        'Fair': '#fb923c',
+                        'Poor': '#ef4444'
+                    }
+                )
+
+                # Add quality threshold lines
+                fig.add_hline(y=5, line_dash="dash", line_color="green", annotation_text="Excellent Threshold")
+                fig.add_hline(y=10, line_dash="dash", line_color="orange", annotation_text="Good Threshold")
+                fig.add_hline(y=20, line_dash="dash", line_color="red", annotation_text="Fair Threshold")
+
+                st.plotly_chart(fig, use_container_width=True)
+
+                # Correlation analysis
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    # Box plot by quality category
+                    fig2 = px.box(
+                        valid_errors,
+                        x='quality',
+                        y='mean_homo_err',
+                        title="Error Distribution by Quality",
+                        category_orders={'quality': ['Excellent', 'Good', 'Fair', 'Poor']}
+                    )
+                    st.plotly_chart(fig2, use_container_width=True)
+
+                with col2:
+                    # Correlation heatmap
+                    corr_cols = ['match_count', 'mean_homo_err', 'std_homo_err', 'num_inliers']
+                    corr_data = valid_errors[corr_cols].dropna()
+                    if not corr_data.empty:
+                        correlation = corr_data.corr()
+                        fig3 = px.imshow(
+                            correlation,
+                            text_auto=True,
+                            aspect="auto",
+                            title="Feature Correlation Matrix",
+                            color_continuous_scale='RdBu'
+                        )
+                        st.plotly_chart(fig3, use_container_width=True)
         else:
-            plot_top_matches_by_homography(
-                config,
-                num_matches=args.num_matches,
-                max_error=args.max_error,
-                save_path=args.save
-            )
+            st.info("Load matches in the Table View first to see analytics")
 
-    except ValueError as e:
-        print(f"Configuration error: {e}")
-        print("\nPlease ensure your .env file contains:")
-        print("  BASE_PATH=/path/to/data")
-        print("  MODEL_TYPE=experiment_name")
-        print("\nAlso ensure you have run the homography error computation")
-        print("on your matches database before visualization.")
+    with tab3:
+        # Error distribution analysis
+        if 'matches_df' in st.session_state and not st.session_state.matches_df.empty:
+            matches_df = st.session_state.matches_df
 
-    except Exception as e:
-        print(f"Error: {e}")
-        raise
+            st.subheader("Homography Error Distribution")
+
+            valid_errors = matches_df[matches_df['mean_homo_err'].notna()]
+
+            if not valid_errors.empty:
+                # Histogram
+                fig1 = px.histogram(
+                    valid_errors,
+                    x='mean_homo_err',
+                    nbins=50,
+                    title="Distribution of Mean Homography Errors",
+                    labels={'mean_homo_err': 'Mean Error (pixels)', 'count': 'Frequency'},
+                    color_discrete_sequence=['#7c3aed']
+                )
+                fig1.add_vline(x=5, line_dash="dash", line_color="green", annotation_text="Excellent")
+                fig1.add_vline(x=10, line_dash="dash", line_color="orange", annotation_text="Good")
+                fig1.add_vline(x=20, line_dash="dash", line_color="red", annotation_text="Fair")
+                st.plotly_chart(fig1, use_container_width=True)
+
+                # Summary statistics
+                st.subheader("Summary Statistics")
+
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    st.markdown("**Homography Error Statistics:**")
+                    error_stats = valid_errors['mean_homo_err'].describe()
+                    stats_df = pd.DataFrame({
+                        'Metric': ['Count', 'Mean', 'Std', 'Min', '25%', '50% (Median)', '75%', 'Max'],
+                        'Value (px)': [
+                            f"{error_stats['count']:.0f}",
+                            f"{error_stats['mean']:.2f}",
+                            f"{error_stats['std']:.2f}",
+                            f"{error_stats['min']:.2f}",
+                            f"{error_stats['25%']:.2f}",
+                            f"{error_stats['50%']:.2f}",
+                            f"{error_stats['75%']:.2f}",
+                            f"{error_stats['max']:.2f}"
+                        ]
+                    })
+                    st.dataframe(stats_df, hide_index=True, use_container_width=True)
+
+                with col2:
+                    st.markdown("**Match Count vs Error Correlation:**")
+                    correlation = valid_errors[['match_count', 'mean_homo_err']].corr().iloc[0, 1]
+                    st.metric("Correlation Coefficient", f"{correlation:.3f}")
+
+                    if correlation < -0.3:
+                        st.info("Strong negative correlation: More matches tend to have lower errors")
+                    elif correlation < -0.1:
+                        st.info("Weak negative correlation: Slight tendency for more matches to have lower errors")
+                    elif correlation < 0.1:
+                        st.info("No significant correlation between match count and error")
+                    elif correlation < 0.3:
+                        st.info("Weak positive correlation: Slight tendency for more matches to have higher errors")
+                    else:
+                        st.info("Strong positive correlation: More matches tend to have higher errors")
+        else:
+            st.info("Load matches in the Table View first to see error distribution")
 
 
 if __name__ == "__main__":
