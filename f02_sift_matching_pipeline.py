@@ -227,33 +227,42 @@ class DatabaseManager:
             print(f"Found {len(processed_pairs)} previously processed pairs")
             return processed_pairs
 
-    def get_top_matches(self, limit: int = 1000, min_matches: int = 1) -> Iterator[Tuple]:
+    def get_top_matches(self, limit: int = 1000, min_matches: int = 1, include_non_matches: bool = False) -> Iterator[
+        Tuple]:
         """
         Stream top matches without loading all results into memory.
 
-        This generator function allows processing of large result sets without
-        memory overflow by yielding results one at a time.
+        Modified to handle -1 (non-match) entries. By default, these are excluded,
+        but they can be included for completeness analysis.
 
         Args:
             limit (int): Maximum number of results to return
-            min_matches (int): Minimum match count threshold
+            min_matches (int): Minimum match count threshold (use 0 to include -1 entries)
+            include_non_matches (bool): If True, include pairs with -1 match count
 
         Yields:
             Tuple: (file1, file2, match_count, matches_data, is_validated)
-
-        Usage Example:
-            for file1, file2, count, data, validated in db.get_top_matches(1000):
-                if count > 50:  # Process high-confidence matches
-                    analyze_match(file1, file2, data)
         """
         with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.execute("""
-                SELECT file1, file2, match_count, matches_data, is_validated
-                FROM matches 
-                WHERE match_count >= ?
-                ORDER BY match_count DESC 
-                LIMIT ?
-            """, (min_matches, limit))
+            if include_non_matches:
+                # Include all entries, even -1 (non-matches)
+                # This is useful for understanding the full comparison space
+                cursor = conn.execute("""
+                    SELECT file1, file2, match_count, matches_data, is_validated
+                    FROM matches 
+                    ORDER BY match_count DESC 
+                    LIMIT ?
+                """, (limit,))
+            else:
+                # Default behavior: exclude non-matches (-1 entries)
+                # Only return pairs with actual matches
+                cursor = conn.execute("""
+                    SELECT file1, file2, match_count, matches_data, is_validated
+                    FROM matches 
+                    WHERE match_count >= ?
+                    ORDER BY match_count DESC 
+                    LIMIT ?
+                """, (min_matches, limit))
 
             for row in cursor:
                 yield row
@@ -287,35 +296,36 @@ class DatabaseManager:
         """
         Retrieve comprehensive database statistics for analysis and monitoring.
 
-        Returns:
-            Dict: Statistics including total matches, validation metrics, and match quality
+        Enhanced to separately report on successful matches vs. non-matches,
+        providing a complete picture of the comparison space.
 
-        Example Output:
-            {
-                'total_matches': 1500000,
-                'validated_matches': 45000,
-                'avg_match_count': 12.5,
-                'max_match_count': 234
-            }
+        Returns:
+            Dict: Enhanced statistics including match distribution
         """
         with sqlite3.connect(self.db_path) as conn:
+            # Get overall statistics
             cursor = conn.execute("""
                 SELECT 
-                    COUNT(*) as total_matches,
+                    COUNT(*) as total_comparisons,
+                    SUM(CASE WHEN match_count > 0 THEN 1 ELSE 0 END) as successful_matches,
+                    SUM(CASE WHEN match_count = -1 THEN 1 ELSE 0 END) as non_matches,
                     SUM(is_validated) as validated_matches,
-                    AVG(match_count) as avg_match_count,
+                    AVG(CASE WHEN match_count > 0 THEN match_count END) as avg_match_count,
                     MAX(match_count) as max_match_count
                 FROM matches
             """)
             result = cursor.fetchone()
 
             return {
-                'total_matches': result[0] or 0,
-                'validated_matches': result[1] or 0,
-                'avg_match_count': result[2] or 0.0,
-                'max_match_count': result[3] or 0
+                'total_comparisons': result[0] or 0,
+                'successful_matches': result[1] or 0,
+                'non_matches': result[2] or 0,
+                'validated_matches': result[3] or 0,
+                'avg_match_count': result[4] or 0.0,
+                'max_match_count': result[5] or 0,
+                # Calculate the success rate
+                'match_success_rate': (result[1] / result[0] * 100) if result[0] > 0 else 0
             }
-
 
 class MemoryMappedFeatureCache:
     """
@@ -585,36 +595,32 @@ class ParallelFragmentMatcher:
         """
         Calculate SIFT matches between two images with quality filtering.
 
-        This is the core matching function that:
-        1. Loads SIFT features from cache
-        2. Performs brute-force matching
-        3. Applies Lowe's ratio test for quality
-        4. Serializes match data for storage
+        Modified version: Now returns a MatchResult even when no good matches
+        are found, using -1 as a sentinel value to indicate "checked but no matches".
+
+        This change enables complete tracking of all comparisons, which is useful for:
+        - Confirming that specific pairs have been checked
+        - Statistical analysis of negative results
+        - Understanding the distribution of match quality
 
         Args:
             file1 (str): Path to first image
             file2 (str): Path to second image
 
         Returns:
-            Optional[MatchResult]: Match result or None if insufficient matches
-
-        Quality Control:
-        - Ratio test threshold: 0.75 (standard for SIFT)
-        - Minimum matches: 1 (could be increased for stricter filtering)
-        - Distance threshold: Implicit in ratio test
-
-        Performance Notes:
-        - Feature loading: ~10ms per image (cached)
-        - Matching: ~5-50ms depending on feature count
-        - Serialization: ~1ms for typical match sets
+            MatchResult: Always returns a result (unless features cannot be extracted)
+                        with match_count = -1 for pairs with no good matches
         """
         try:
             # Load SIFT features (cached for performance)
             kp1, des1 = self.cache.get_features(file1)
             kp2, des2 = self.cache.get_features(file2)
 
-            # Skip if no features detected
+            # Skip only if features cannot be extracted at all
+            # (this means the images themselves are problematic)
             if des1 is None or des2 is None or len(des1) == 0 or len(des2) == 0:
+                # We still return None here because these images literally
+                # cannot be processed - they might be corrupted or blank
                 return None
 
             # Brute-force matching with k=2 for ratio test
@@ -630,11 +636,20 @@ class ParallelFragmentMatcher:
                     if m.distance < 0.75 * n.distance:
                         good_matches.append((m.queryIdx, m.trainIdx, m.distance))
 
-            # Return None if insufficient matches
+            # HERE'S THE KEY CHANGE: Instead of returning None when no good matches,
+            # we return a MatchResult with count = -1
             if len(good_matches) == 0:
-                return None
+                # Create a special result indicating "checked but no matches"
+                # We store an empty byte string for matches_data since there's nothing to store
+                return MatchResult(
+                    file1=os.path.basename(file1),
+                    file2=os.path.basename(file2),
+                    match_count=-1,  # Sentinel value indicating no matches found
+                    matches_data=b'',  # Empty data since no matches to store
+                    is_validated=False
+                )
 
-            # Serialize match data for detailed analysis
+            # For successful matches, proceed as before
             matches_data = pickle.dumps(good_matches)
 
             return MatchResult(
@@ -647,7 +662,6 @@ class ParallelFragmentMatcher:
         except Exception as e:
             print(f"Error processing {os.path.basename(file1)} vs {os.path.basename(file2)}: {e}")
             return None
-
     def _process_batch(self, image_pairs: List[Tuple[str, str]]) -> List[MatchResult]:
         """
         Process a batch of image pairs in a single worker thread.
@@ -677,26 +691,8 @@ class ParallelFragmentMatcher:
         """
         Execute parallel matching across all image pairs with resume capability.
 
-        This is the main processing function that:
-        1. Discovers all image files
-        2. Generates pairs (excluding same-directory matches)
-        3. Filters out already-processed pairs
-        4. Distributes work across parallel workers
-        5. Saves results to database in batches
-
-        Args:
-            batch_size (int): Number of pairs per worker batch
-
-        Optimization Strategy:
-        - Skip same-directory pairs (likely duplicates/versions)
-        - Resume from previous runs to handle interruptions
-        - Batch database writes for I/O efficiency
-        - Progress tracking for long-running jobs
-
-        Performance Expectations:
-        - ~1000 pairs/minute on modern hardware (depends on image size)
-        - Linear scaling with CPU cores up to I/O bottleneck
-        - Memory usage bounded by batch size and cache size
+        Enhanced version with detailed statistics on filtering efficiency,
+        particularly tracking same-folder pair elimination.
         """
         start_time = time.time()
 
@@ -708,31 +704,93 @@ class ParallelFragmentMatcher:
         processed_pairs = self.db.get_processed_pairs()
         print(f"Resuming from {len(processed_pairs)} already processed pairs")
 
-        # Generate pairs to process with filtering
+        # Initialize counters for detailed statistics
+        # These help us understand the filtering efficiency
+        total_theoretical_pairs = 0  # Total possible pairs (n * (n-1) / 2)
+        same_folder_skipped = 0  # Pairs skipped due to same folder
+        already_processed_skipped = 0  # Pairs skipped due to resume capability
         pairs_to_process = []
+
+        # Let's also track folder statistics for deeper insight
+        folder_distribution = {}  # Track how many images are in each folder
+
+        # First, analyze the folder distribution
+        for image_file in image_files:
+            folder = os.path.dirname(image_file)
+            if folder not in folder_distribution:
+                folder_distribution[folder] = 0
+            folder_distribution[folder] += 1
+
+        # Calculate theoretical same-folder pairs for reporting
+        theoretical_same_folder_pairs = 0
+        for folder, count in folder_distribution.items():
+            if count > 1:
+                # For n images in same folder: n * (n-1) / 2 pairs
+                theoretical_same_folder_pairs += (count * (count - 1)) // 2
+
+        print(f"\n📁 Folder Distribution Analysis:")
+        print(f"  Number of folders: {len(folder_distribution)}")
+        print(f"  Average images per folder: {len(image_files) / len(folder_distribution):.1f}")
+        print(f"  Theoretical same-folder pairs: {theoretical_same_folder_pairs:,}")
+
+        # Generate pairs to process with detailed tracking
         for i in range(len(image_files)):
             for j in range(i + 1, len(image_files)):
+                total_theoretical_pairs += 1
                 file1, file2 = image_files[i], image_files[j]
 
-                # Skip same directory (likely versions/duplicates)
+                # Check if same directory (likely versions/duplicates)
                 if os.path.dirname(file1) == os.path.dirname(file2):
+                    same_folder_skipped += 1
                     continue
 
-                # Skip if already processed (resume capability)
+                # Check if already processed (resume capability)
                 basename1, basename2 = os.path.basename(file1), os.path.basename(file2)
                 if (basename1, basename2) in processed_pairs or (basename2, basename1) in processed_pairs:
+                    already_processed_skipped += 1
                     continue
 
                 pairs_to_process.append((file1, file2))
 
+        # Calculate and display comprehensive filtering statistics
         total_pairs = len(pairs_to_process)
-        print(f"Processing {total_pairs:,} new pairs")
+        total_filtered = same_folder_skipped + already_processed_skipped
+
+        print(f"\n🔍 Filtering Statistics:")
+        print(f"  Total theoretical pairs: {total_theoretical_pairs:,}")
+        print(f"  ├─ Same-folder pairs skipped: {same_folder_skipped:,} "
+              f"({same_folder_skipped / total_theoretical_pairs * 100:.1f}%)")
+        print(f"  ├─ Already processed pairs skipped: {already_processed_skipped:,} "
+              f"({already_processed_skipped / total_theoretical_pairs * 100:.1f}%)")
+        print(f"  └─ Pairs to process now: {total_pairs:,} "
+              f"({total_pairs / total_theoretical_pairs * 100:.1f}%)")
+
+        # Calculate time and resource savings
+        estimated_time_per_pair = 0.05  # Approximate seconds per pair (adjust based on your hardware)
+        time_saved_seconds = same_folder_skipped * estimated_time_per_pair
+        time_saved_hours = time_saved_seconds / 3600
+
+        print(f"\n⏱️  Estimated Time Savings from Same-Folder Filter:")
+        print(f"  Comparisons avoided: {same_folder_skipped:,}")
+        print(f"  Estimated time saved: {time_saved_hours:.1f} hours")
+        print(f"  Efficiency gain: {(same_folder_skipped / total_theoretical_pairs * 100):.1f}% reduction in work")
+
+        # Show folder pair statistics for deeper insight
+        if len(folder_distribution) > 1:
+            print(f"\n📊 Cross-Folder Comparison Statistics:")
+            different_folder_pairs = total_theoretical_pairs - theoretical_same_folder_pairs
+            print(f"  Cross-folder pairs (potential matches): {different_folder_pairs:,}")
+            print(f"  Same-folder pairs (filtered out): {theoretical_same_folder_pairs:,}")
+            print(f"  Ratio: {different_folder_pairs / theoretical_same_folder_pairs:.2f}:1 "
+                  f"(processing {different_folder_pairs / total_theoretical_pairs * 100:.1f}% of total)")
 
         if total_pairs == 0:
-            print("No new pairs to process!")
+            print("\n✅ No new pairs to process! All pairs have been processed.")
             return
 
-        # Process in parallel batches with progress tracking
+        print(f"\n🚀 Starting processing of {total_pairs:,} new pairs...")
+
+        # Continue with the normal processing...
         from tqdm import tqdm
 
         with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
@@ -765,13 +823,24 @@ class ParallelFragmentMatcher:
             if all_results:
                 self.db.batch_insert_matches(all_results)
 
-        # Report final statistics
+        # Report final statistics with filtering context
         elapsed_time = time.time() - start_time
         stats = self.db.get_statistics()
 
-        print(f"\nMatching completed in {elapsed_time:.1f} seconds")
+        print(f"\n✅ Matching completed in {elapsed_time:.1f} seconds")
         print(f"Processing rate: {total_pairs / elapsed_time:.1f} pairs/second")
-        print(f"Database statistics: {stats}")
+
+        # Calculate what the time would have been WITHOUT the same-folder filter
+        theoretical_time_without_filter = elapsed_time * (total_pairs + same_folder_skipped) / total_pairs
+        actual_time_saved = theoretical_time_without_filter - elapsed_time
+
+        print(f"\n💡 Performance Impact of Same-Folder Filter:")
+        print(f"  Time without filter (estimated): {theoretical_time_without_filter:.1f} seconds")
+        print(f"  Actual time with filter: {elapsed_time:.1f} seconds")
+        print(
+            f"  Time saved: {actual_time_saved:.1f} seconds ({actual_time_saved / theoretical_time_without_filter * 100:.1f}%)")
+
+        print(f"\n📈 Database statistics: {stats}")
 
     def validate_with_pam(self, pam_data_path: str):
         """

@@ -18,7 +18,7 @@ def load_env_arguments(use_clean_csv: bool = True):
         args["pam_files_to_process"].sort()
 
     args["image_path"] = os.path.join(args["base_path"], args["images_in"])
-    args["patches_path"] = os.path.join(args["base_path"], args["patches_in"])
+    args["patches_path"] = os.path.join(args["base_path"], args["patches_dir"])
 
     csv = (
         args["clean_sift_matches_w_tp_w_homo"]
