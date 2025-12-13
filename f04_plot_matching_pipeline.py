@@ -665,7 +665,7 @@ def main():
                         st.image(img2, caption=f"Fragment 2: {selected_match['file2']}", use_container_width=True)
 
                     # Show combined visualization
-                    if st.checkbox("Show match visualization with connection lines"):
+                    if st.checkbox("Show match visualization with connection lines" , value=True):
                         match_data = viewer.get_match_details(selected_match['id'])
                         if match_data:
                             combined = viewer.visualize_matches_with_lines(img1, img2, match_data)
