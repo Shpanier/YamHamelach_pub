@@ -12,3 +12,7 @@
 /.vscode
 
 **/__pycache__
+backup_*.zip
+backup_*/
+*.docx
+~.docx
