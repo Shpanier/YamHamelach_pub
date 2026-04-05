@@ -66,6 +66,7 @@ class MatchResult:
     match_count: int
     matches_data: bytes  # Serialized match data for detailed analysis
     is_validated: bool = False
+    pruned_at_stage: str = None  # None=active, 'f02'=below min matches, 'f03'=above max homo error
 
 
 class DatabaseManager:
@@ -126,13 +127,22 @@ class DatabaseManager:
                 CREATE TABLE IF NOT EXISTS matches (
                     id INTEGER PRIMARY KEY,
                     file1 TEXT NOT NULL,                    -- First fragment filename
-                    file2 TEXT NOT NULL,                    -- Second fragment filename  
+                    file2 TEXT NOT NULL,                    -- Second fragment filename
                     match_count INTEGER NOT NULL,           -- Number of good SIFT matches
                     matches_data BLOB,                      -- Serialized detailed match data
                     is_validated INTEGER DEFAULT 0,        -- Ground truth validation status
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP  -- Processing timestamp
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,  -- Processing timestamp
+                    pruned_at_stage TEXT DEFAULT NULL       -- Which pipeline stage pruned this row
+                                                           -- NULL = active, 'f02' = below min matches,
+                                                           -- 'f03' = above max homo error
                 )
             """)
+
+            # Add pruned_at_stage column if upgrading an existing database
+            try:
+                conn.execute("ALTER TABLE matches ADD COLUMN pruned_at_stage TEXT DEFAULT NULL")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
 
             # Create optimized indexes for common query patterns
             conn.execute("CREATE INDEX IF NOT EXISTS idx_file1 ON matches(file1)")
@@ -140,6 +150,7 @@ class DatabaseManager:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_files ON matches(file1, file2)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_match_count ON matches(match_count DESC)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_validated ON matches(is_validated)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_pruned ON matches(pruned_at_stage)")
 
             # Create resume capability table - tracks which pairs have been processed
             conn.execute("""
@@ -181,12 +192,13 @@ class DatabaseManager:
                 for i in range(0, len(matches), batch_size):
                     batch = matches[i:i + batch_size]
 
-                    # Insert match results
+                    # Insert match results (with pruned_at_stage if present)
                     conn.executemany("""
-                        INSERT INTO matches (file1, file2, match_count, matches_data, is_validated)
-                        VALUES (?, ?, ?, ?, ?)
+                        INSERT INTO matches (file1, file2, match_count, matches_data, is_validated, pruned_at_stage)
+                        VALUES (?, ?, ?, ?, ?, ?)
                     """, [
-                        (m.file1, m.file2, m.match_count, m.matches_data, m.is_validated)
+                        (m.file1, m.file2, m.match_count, m.matches_data, m.is_validated,
+                         getattr(m, 'pruned_at_stage', None))
                         for m in batch
                     ])
 
@@ -545,7 +557,8 @@ class ParallelFragmentMatcher:
     - Database provides persistent state for very long runs
     """
 
-    def __init__(self, image_base_path: str, cache_dir: str, db_path: str, num_workers: int = 4):
+    def __init__(self, image_base_path: str, cache_dir: str, db_path: str,
+                 num_workers: int = 4, early_prune_min_matches: int = 0):
         """
         Initialize parallel matcher with optimized components.
 
@@ -554,15 +567,21 @@ class ParallelFragmentMatcher:
             cache_dir (str): Directory for feature cache storage
             db_path (str): Path to SQLite database
             num_workers (int): Number of parallel worker threads
+            early_prune_min_matches (int): If > 0, matches below this count are marked
+                                           pruned_at_stage='f02' and stored without matches_data
+                                           blob (saves DB space, skipped by f03). 0 = disabled.
         """
         self.image_base_path = image_base_path
         self.cache = MemoryMappedFeatureCache(cache_dir)
         self.db = DatabaseManager(db_path)
         self.num_workers = num_workers
+        self.early_prune_min_matches = early_prune_min_matches
         self._match_lock = threading.Lock()  # Synchronize database writes
 
         print(f"Matcher initialized with {num_workers} workers")
         print(f"Image path: {image_base_path}")
+        if early_prune_min_matches > 0:
+            print(f"Early pruning enabled: matches < {early_prune_min_matches} marked as pruned (skipped by f03)")
 
     def get_image_files(self) -> List[str]:
         """
@@ -649,7 +668,20 @@ class ParallelFragmentMatcher:
                     is_validated=False
                 )
 
-            # For successful matches, proceed as before
+            # Early pruning: if below threshold, store the count but skip the
+            # heavy matches_data blob. This row will be marked pruned_at_stage='f02'
+            # and f03 will skip it entirely, saving significant computation.
+            if (self.early_prune_min_matches > 0
+                    and len(good_matches) < self.early_prune_min_matches):
+                return MatchResult(
+                    file1=os.path.basename(file1),
+                    file2=os.path.basename(file2),
+                    match_count=len(good_matches),
+                    matches_data=b'',  # Don't store blob for pruned matches
+                    pruned_at_stage='f02'
+                )
+
+            # For matches above threshold, proceed as before
             matches_data = pickle.dumps(good_matches)
 
             return MatchResult(
@@ -1028,7 +1060,10 @@ def load_env_config():
         'export_limit': int(os.getenv('EXPORT_LIMIT', '10000')),
 
         # Debugging and monitoring
-        'debug': os.getenv('DEBUG', 'false').lower() == 'true'
+        'debug': os.getenv('DEBUG', 'false').lower() == 'true',
+
+        # Early pruning (0 = disabled)
+        'early_prune_min_matches': int(os.getenv('EARLY_PRUNE_MIN_MATCHES', '0')),
     }
 
     return config
@@ -1088,7 +1123,8 @@ class OptimizedFragmentMatchingPipeline:
             image_base_path=self.config['image_base_path'],
             cache_dir=self.config['cache_dir'],
             db_path=self.config['db_path'],
-            num_workers=self.config['num_workers']
+            num_workers=self.config['num_workers'],
+            early_prune_min_matches=self.config.get('early_prune_min_matches', 0)
         )
 
         if self.config['debug']:

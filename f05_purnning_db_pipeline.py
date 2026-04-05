@@ -56,9 +56,9 @@ def prune_database(input_db, output_db, keep_top_n=5000, min_match_count=10, max
         )
     ''')
 
-    # Query to get the best matches
+    # Query to get the best matches (skip rows already pruned by f02/f03)
     query = """
-    SELECT 
+    SELECT
         m.id,
         m.file1,
         m.file2,
@@ -77,7 +77,8 @@ def prune_database(input_db, output_db, keep_top_n=5000, min_match_count=10, max
     WHERE m.match_count >= ?
         AND (h.mean_homo_err IS NULL OR h.mean_homo_err <= ?)
         AND h.is_valid = 1
-    ORDER BY 
+        AND m.pruned_at_stage IS NULL
+    ORDER BY
         CASE WHEN h.mean_homo_err IS NULL THEN 999999 ELSE h.mean_homo_err END ASC
     LIMIT ?
     """
@@ -207,34 +208,73 @@ def prune_images(matches_db, image_input_dir, image_output_dir , type_="patches"
     return copied_count
 
 
+def load_config():
+    """Load configuration from .env file."""
+    from pathlib import Path
+    try:
+        from dotenv import dotenv_values
+    except ImportError:
+        dotenv_values = None
+
+    script_dir = Path(__file__).parent
+    env_path = script_dir / ".env"
+
+    env = {}
+    if dotenv_values and env_path.exists():
+        raw = dotenv_values(env_path)
+        env = {k.lower(): v for k, v in raw.items()}
+    elif env_path.exists():
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    env[k.strip().lower()] = v.strip().strip('"').strip("'")
+
+    base_path = env.get("base_path", "")
+    output_dir = env.get("output_dir", "OUTPUT_faster_rcnn")
+    output_base = os.path.join(base_path, output_dir)
+
+    patches_dir = env.get("patches_dir", "output_patches")
+    bbox_dir = env.get("bbox_dir", "output_bbox")
+    pruned_db = env.get("pruned_db", "matches_pruned.db")
+    pruned_patches = env.get("pruned_patches_dir", "output_patches_pruned")
+    pruned_bbox = env.get("pruned_bbox_dir", "output_bbox_pruned")
+
+    return {
+        "input_db": os.path.join(output_base, "matches.db"),
+        "output_db": os.path.join(output_base, pruned_db),
+        "input_patches": os.path.join(output_base, patches_dir),
+        "output_patches": os.path.join(output_base, pruned_patches),
+        "input_bbox": os.path.join(output_base, bbox_dir),
+        "output_bbox": os.path.join(output_base, pruned_bbox),
+        "min_match_count": int(env.get("early_prune_min_matches", "10")),
+        "max_homo_error": float(env.get("early_prune_max_homo_error", "200")),
+    }
+
+
 if __name__ == "__main__":
-    # Configuration
-    INPUT_DB = "/Users/assafspanier/Dropbox/YamHamelach_data_n_model/OUTPUT_faster_rcnn/matches.db"
-    OUTPUT_DB = "/Users/assafspanier/Dropbox/YamHamelach_data_n_model/OUTPUT_faster_rcnn/matches_pruned.db"
+    config = load_config()
 
-    INPUT_PATCHES = "/Users/assafspanier/Dropbox/YamHamelach_data_n_model/OUTPUT_faster_rcnn/output_patches"
-    OUTPUT_PATCHES = "/Users/assafspanier/Dropbox/YamHamelach_data_n_model/OUTPUT_faster_rcnn/output_patches_pruned"
-
-    INPUT_BBOX = "/Users/assafspanier/Dropbox/YamHamelach_data_n_model/OUTPUT_faster_rcnn/output_bbox"
-    OUTPUT_BBOX = "/Users/assafspanier/Dropbox/YamHamelach_data_n_model/OUTPUT_faster_rcnn/output_bbox_pruned"
-
-    # Prune database - adjust parameters as needed
     print("🔄 Starting database pruning...")
+    print(f"  Input DB:  {config['input_db']}")
+    print(f"  Output DB: {config['output_db']}")
+
     prune_database(
-        INPUT_DB,
-        OUTPUT_DB,
-        keep_top_n=4000,  # Keep only top 2000 matches
-        min_match_count=10,  # Minimum 15 SIFT matches
-        max_homo_error=200  # Maximum homography error of 50 pixels
+        config["input_db"],
+        config["output_db"],
+        keep_top_n=4000,
+        min_match_count=config["min_match_count"],
+        max_homo_error=config["max_homo_error"],
     )
 
     # Prune images to match database
     print("\n🔄 Starting image pruning...")
     print("Pruning patches...")
-    prune_images(OUTPUT_DB, INPUT_PATCHES, OUTPUT_PATCHES ,  type_="patches")
+    prune_images(config["output_db"], config["input_patches"], config["output_patches"], type_="patches")
 
     print("\nPruning bbox images...")
-    prune_images(OUTPUT_DB, INPUT_BBOX, OUTPUT_BBOX ,  type_="bbox")
+    prune_images(config["output_db"], config["input_bbox"], config["output_bbox"], type_="bbox")
 
     print("\n✅ All pruning complete!")
     print("Use the '_pruned' versions for deployment")

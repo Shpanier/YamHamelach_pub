@@ -434,12 +434,13 @@ class HomographyDatabaseManager:
         """
         conn = self.get_connection()
         try:
-            # Get current batch
+            # Get current batch (skip rows already pruned by earlier stages)
             cursor = conn.execute("""
                 SELECT m.id, m.file1, m.file2, m.match_count, m.matches_data
                 FROM matches m
                 LEFT JOIN homography_errors he ON m.id = he.match_id
                 WHERE he.match_id IS NULL
+                  AND m.pruned_at_stage IS NULL
                 ORDER BY m.match_count DESC
                 LIMIT ? OFFSET ?
             """, (batch_size * (1 + prefetch_size), offset))
@@ -468,6 +469,7 @@ class HomographyDatabaseManager:
                 LEFT JOIN homography_errors he ON m.id = he.match_id
                 WHERE he.match_id IS NULL
                   AND m.match_count > ?
+                  AND m.pruned_at_stage IS NULL
                 ORDER BY m.match_count DESC
                 LIMIT ? OFFSET ?
             """, (min_match_count, batch_size, offset))
@@ -485,8 +487,23 @@ class HomographyDatabaseManager:
                 LEFT JOIN homography_errors he ON m.id = he.match_id
                 WHERE he.match_id IS NULL
                   AND m.match_count > ?
+                  AND m.pruned_at_stage IS NULL
             """, (min_match_count,))
             return cursor.fetchone()[0]
+        finally:
+            self.return_connection(conn)
+
+    def batch_mark_pruned_at_f03(self, match_ids: List[int]):
+        """Mark matches as pruned at f03 stage (homography error too high)."""
+        if not match_ids:
+            return
+        conn = self.get_connection()
+        try:
+            conn.executemany(
+                "UPDATE matches SET pruned_at_stage = 'f03' WHERE id = ?",
+                [(mid,) for mid in match_ids]
+            )
+            conn.commit()
         finally:
             self.return_connection(conn)
 
@@ -1072,9 +1089,11 @@ class ParallelHomographyProcessor:
         error_cache_dir: str,
         num_workers: int = 4,
         min_match_count: int = 1000,
+        early_prune_max_homo_error: float = 0,
     ):
         """Initialize parallel processor."""
         self.db = HomographyDatabaseManager(db_path)
+        self.early_prune_max_homo_error = early_prune_max_homo_error
 
         ### PHASE 2 OPTIMIZATION: Dynamic sizing ###
         self.batch_sizer = DynamicBatchSizer()
@@ -1149,6 +1168,15 @@ class ParallelHomographyProcessor:
                 ))
                 invalid += 1
 
+        # Early pruning: mark matches with excessive homography error
+        if self.early_prune_max_homo_error > 0:
+            prune_ids = [
+                r.match_id for r in results
+                if r.is_valid and r.mean_homo_err > self.early_prune_max_homo_error
+            ]
+            if prune_ids:
+                self.db.batch_mark_pruned_at_f03(prune_ids)
+
         return results, len(results), valid, invalid
 
     ### PHASE 2 OPTIMIZATION: Enhanced batch processing ###
@@ -1173,6 +1201,8 @@ class ParallelHomographyProcessor:
         print("  ✓ NumPy vectorization: ENABLED")
         print("  ✓ Database query optimization: ENABLED")
         print("  ✓ Memory-mapped caching: ENABLED")
+        if self.early_prune_max_homo_error > 0:
+            print(f"  ✓ Early pruning: matches with mean_homo_err > {self.early_prune_max_homo_error} marked as pruned (skipped by f05)")
 
         # Dynamic batch sizing
         if batch_size is None:
@@ -1437,6 +1467,8 @@ def load_config():
         'export_limit': int(os.getenv('EXPORT_LIMIT', '10000')),
         'min_match_count': int(os.getenv('MIN_MATCH_COUNT', '0')),
 
+        # Early pruning (0 = disabled)
+        'early_prune_max_homo_error': float(os.getenv('EARLY_PRUNE_MAX_HOMO_ERROR', '0')),
     }
 
     return config
@@ -1488,7 +1520,8 @@ def main():
             feature_cache_dir=config['feature_cache_dir'],
             error_cache_dir=config['error_cache_dir'],
             num_workers=config['num_workers'],
-            min_match_count = config['min_match_count']
+            min_match_count=config['min_match_count'],
+            early_prune_max_homo_error=config.get('early_prune_max_homo_error', 0),
         )
 
         if args.mode in ["process", "all"]:
