@@ -998,61 +998,48 @@ import os
 from dotenv import load_dotenv
 
 
-def load_env_config():
+def load_env_config(db_name: str = None):
     """
     Load pipeline configuration from environment variables (.env file).
 
     This configuration system allows easy deployment across different environments
     without code changes. All paths and parameters are externalized.
 
-    Required Environment Variables:
-    - BASE_PATH: Root directory for all data
-    - MODEL_TYPE: Identifier for this run (allows multiple concurrent pipelines)
-
-    Optional Environment Variables:
-    - PATCHES_DIR: Subdirectory containing image fragments (default: 'patches')
-    - PATCHES_CACHE: Cache directory name (default: 'cache')
-    - DB_NAME: Database filename (default: 'matches.db')
-    - PAM_CSV: Ground truth filename (default: 'pam.csv')
-    - OUTPUT_CSV: Results filename (default: 'top_matches.csv')
-    - NUM_WORKERS: Parallel worker count (default: 8)
-    - BATCH_SIZE: Processing batch size (default: 200)
-    - EXPORT_LIMIT: Maximum exported matches (default: 10000)
-    - DEBUG: Enable debug output (default: false)
+    Args:
+        db_name: Database profile name (e.g. '180', '354').
+                 If None, uses DEFAULT_DB_PROFILE from .env.
 
     Returns:
         dict: Complete configuration dictionary
 
     Raises:
         ValueError: If required environment variables are missing
-
-    Example .env file:
-        BASE_PATH=/data/papyrus
-        MODEL_TYPE=experiment_v1
-        NUM_WORKERS=16
-        BATCH_SIZE=500
-        DEBUG=true
     """
     load_dotenv()
 
-    # Validate required configuration
-    base_path = os.getenv('BASE_PATH')
+    # Resolve database profile
+    from db_profile import resolve_profile
+    profile = resolve_profile(db_name)
+
+    base_path = profile.base_path
     if not base_path:
         raise ValueError("BASE_PATH not found in .env file")
 
-    model_type = os.getenv('MODEL_TYPE', 'default')
+    output_base = profile.output_base
 
     # Build complete configuration with defaults
     config = {
         'base_path': base_path,
-        'model_type': model_type,
+        'db_profile': profile.name,
+        'db_label': profile.label,
+        'output_dir': profile.output_dir,
 
-        # Derived paths (all under BASE_PATH/OUTPUT_MODEL_TYPE/)
-        'image_base_path': os.path.join(base_path, f"OUTPUT_{model_type}", os.getenv('PATCHES_DIR', 'patches')),
-        'cache_dir': os.path.join(base_path, f"OUTPUT_{model_type}", os.getenv('PATCHES_CACHE', 'cache')),
-        'db_path': os.path.join(base_path, f"OUTPUT_{model_type}", os.getenv('DB_NAME', 'matches.db')),
-        'pam_data_path': os.path.join(base_path, f"OUTPUT_{model_type}", os.getenv('PAM_CSV', 'pam.csv')),
-        'output_csv_path': os.path.join(base_path, f"OUTPUT_{model_type}", os.getenv('OUTPUT_CSV', 'top_matches.csv')),
+        # Derived paths (all under BASE_PATH/OUTPUT_DIR/)
+        'image_base_path': os.path.join(output_base, os.getenv('PATCHES_DIR', 'patches')),
+        'cache_dir': os.path.join(output_base, os.getenv('PATCHES_CACHE', 'cache')),
+        'db_path': os.path.join(output_base, os.getenv('DB_NAME', 'matches.db')),
+        'pam_data_path': os.path.join(output_base, os.getenv('PAM_CSV', 'pam.csv')),
+        'output_csv_path': os.path.join(output_base, os.getenv('OUTPUT_CSV', 'top_matches.csv')),
 
         # Processing parameters
         'num_workers': int(os.getenv('NUM_WORKERS', '8')),
@@ -1524,6 +1511,13 @@ Examples:
         help="Path to .env configuration file (default: .env in current directory)"
     )
 
+    parser.add_argument(
+        "--db",
+        type=str,
+        default=None,
+        help="Database profile name (e.g. '180', '354'). Defaults to DEFAULT_DB_PROFILE in .env."
+    )
+
     args = parser.parse_args()
 
     # Load environment configuration
@@ -1533,7 +1527,9 @@ Examples:
 
     try:
         # Initialize pipeline with environment configuration
-        pipeline = OptimizedFragmentMatchingPipeline()
+        config = load_env_config(db_name=args.db)
+        print(f"Database profile: {config['db_profile']} ({config['db_label']})")
+        pipeline = OptimizedFragmentMatchingPipeline(config=config)
 
         # Execute requested stage
         if args.stage == "matching":

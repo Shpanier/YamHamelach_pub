@@ -658,9 +658,19 @@ def load_args():
         type=float,
         default=args.confidence_threshold
     )
+    parser.add_argument(
+        "--db",
+        help="database profile name (e.g. '180', '354')",
+        type=str,
+        default=None
+    )
 
     parsed_args = parser.parse_args()
-    # return SimpleNamespace(**args, **parsed_args.__dict__)
+
+    # If --db was specified, reload env_arguments with that profile
+    if parsed_args.db is not None:
+        args = load_env_arguments(db_name=parsed_args.db)
+
     merged_dict = {**args.__dict__, **parsed_args.__dict__}
     combined_args = SimpleNamespace(**merged_dict)
     return combined_args
@@ -690,14 +700,19 @@ if __name__ == "__main__":
     args = load_args()
 
     image_path = args.base_path + "/" + args.images_in
-    patches_path = args.base_path +  "/OUTPUT_" + args.model_type + "/" + args.patches_dir
-    bbox_path = args.base_path + "/OUTPUT_" + args.model_type + "/" + args.bbox_dir
+    # Use profile output_dir if available, otherwise fall back to legacy OUTPUT_<model_type>
+    output_dir = getattr(args, 'output_dir', None) or ("OUTPUT_" + args.model_type)
+    patches_path = os.path.join(args.base_path, output_dir, args.patches_dir)
+    bbox_path = os.path.join(args.base_path, output_dir, args.bbox_dir)
     if not os.path.exists(image_path):
         raise FileNotFoundError(f"Input directory '{image_path}' does not exist.")
 
     os.makedirs(patches_path, exist_ok=True)
     os.makedirs(bbox_path, exist_ok=True)
 
+    db_profile = getattr(args, 'db_profile', 'default')
+    db_label = getattr(args, 'db_label', '')
+    print(f"Database profile: {db_profile} ({db_label})")
     print(f"Using model: {args.cp}")
     print(f"Model type: {args.model_type}")
     print(f"Confidence threshold: {args.confidence_threshold}")

@@ -1439,27 +1439,32 @@ class ParallelHomographyProcessor:
         print(f"\n✅ Successfully exported {total_results:,} matches to {os.path.basename(output_path)}")
 
 
-def load_config():
-    """Load configuration from environment variables."""
+def load_config(db_name: str = None):
+    """Load configuration from environment variables with DB profile support."""
     load_dotenv()
 
-    base_path = os.getenv('BASE_PATH')
+    from db_profile import resolve_profile
+    profile = resolve_profile(db_name)
+
+    base_path = profile.base_path
     if not base_path:
         raise ValueError("BASE_PATH not found in .env file")
 
-    model_type = os.getenv('MODEL_TYPE', 'default')
+    output_base = profile.output_base
 
     ### PHASE 2 OPTIMIZATION: Dynamic sizing by default ###
     batch_sizer = DynamicBatchSizer()
 
     config = {
         'base_path': base_path,
-        'model_type': model_type,
-        'db_path': os.path.join(base_path, f"OUTPUT_{model_type}", os.getenv('DB_NAME', 'matches.db')),
-        'image_base_path': os.path.join(base_path, f"OUTPUT_{model_type}", os.getenv('PATCHES_DIR', 'patches')),
-        'feature_cache_dir': os.path.join(base_path, f"OUTPUT_{model_type}", os.getenv('PATCHES_CACHE', 'cache')),
-        'error_cache_dir': os.path.join(base_path, f"OUTPUT_{model_type}", os.getenv('ERROR_CACHE', 'error_cache')),
-        'output_csv': os.path.join(base_path, f"OUTPUT_{model_type}", os.getenv('HOMO_CSV', 'homography_matches.csv')),
+        'db_profile': profile.name,
+        'db_label': profile.label,
+        'output_dir': profile.output_dir,
+        'db_path': os.path.join(output_base, os.getenv('DB_NAME', 'matches.db')),
+        'image_base_path': os.path.join(output_base, os.getenv('PATCHES_DIR', 'patches')),
+        'feature_cache_dir': os.path.join(output_base, os.getenv('PATCHES_CACHE', 'cache')),
+        'error_cache_dir': os.path.join(output_base, os.getenv('ERROR_CACHE', 'error_cache')),
+        'output_csv': os.path.join(output_base, os.getenv('HOMO_CSV', 'homography_matches.csv')),
         'num_workers': int(os.getenv('NUM_WORKERS', str(batch_sizer.get_optimal_workers(8)))),
         'batch_size': int(os.getenv('BATCH_SIZE', str(batch_sizer.get_optimal_batch_size(500)))),
         'process_limit': int(os.getenv('PROCESS_LIMIT', '0')) or None,
@@ -1495,6 +1500,13 @@ def main():
         help="Path to .env configuration file"
     )
 
+    parser.add_argument(
+        "--db",
+        type=str,
+        default=None,
+        help="Database profile name (e.g. '180', '354'). Defaults to DEFAULT_DB_PROFILE in .env."
+    )
+
     args = parser.parse_args()
 
     # Load configuration
@@ -1502,14 +1514,14 @@ def main():
         load_dotenv(args.config)
 
     try:
-        config = load_config()
+        config = load_config(db_name=args.db)
 
         print("\n" + "="*70)
         print(" DATABASE-INTEGRATED HOMOGRAPHY ERROR CALCULATOR")
         print(" PHASE 2 OPTIMIZED VERSION (MPS + ADVANCED)")
         print("="*70)
+        print(f"  Profile: {config['db_profile']} ({config['db_label']})")
         print(f"  Database: {os.path.basename(config['db_path'])}")
-        print(f"  Model type: {config['model_type']}")
         print(f"  Workers: {config['num_workers']}")
         print(f"  Batch size: {config['batch_size']}")
 

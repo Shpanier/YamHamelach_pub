@@ -34,8 +34,10 @@ except ImportError:
 
 # ─── Configuration (loaded from .env) ───────────────────────
 
-def load_config():
-    """Load configuration from .env file."""
+def load_config(db_name: str = None):
+    """Load configuration from .env file with DB profile support."""
+    from db_profile import resolve_profile
+
     script_dir = Path(__file__).parent
     env_path = script_dir / ".env"
 
@@ -51,9 +53,8 @@ def load_config():
                     k, v = line.split("=", 1)
                     env[k.strip().lower()] = v.strip().strip('"').strip("'")
 
-    base_path = env.get("base_path", "")
-    output_dir = env.get("output_dir", "OUTPUT_faster_rcnn")
-    output_base = os.path.join(base_path, output_dir)
+    profile = resolve_profile(db_name)
+    output_base = profile.output_base
 
     pruned_db = env.get("pruned_db", "matches_pruned.db")
     pruned_patches = env.get("pruned_patches_dir", "output_patches_pruned")
@@ -62,6 +63,8 @@ def load_config():
     deploy_path = env.get("deploy_path", "")
 
     return {
+        "db_profile": profile.name,
+        "db_label": profile.label,
         "output_base": output_base,
         "source_db": os.path.join(output_base, pruned_db),
         "source_patches": os.path.join(output_base, pruned_patches),
@@ -256,17 +259,27 @@ def show_deployment_status(deploy_data):
 # ─── Main ────────────────────────────────────────────────────
 
 def main():
-    config = load_config()
+    import argparse
+    parser = argparse.ArgumentParser(description="Deploy pruned pipeline output to DSFV")
+    parser.add_argument("--execute", action="store_true", help="Actually copy files (default: dry run)")
+    parser.add_argument("--clean", action="store_true", help="Wipe destination before copying")
+    parser.add_argument("--status", action="store_true", help="Show deployment state only")
+    parser.add_argument("--db", type=str, default=None,
+                        help="Database profile name (e.g. '180', '354')")
+    args = parser.parse_args()
 
-    execute = "--execute" in sys.argv
-    clean = "--clean" in sys.argv
-    status_only = "--status" in sys.argv
+    config = load_config(db_name=args.db)
+
+    execute = args.execute
+    clean = args.clean
+    status_only = args.status
 
     deploy_data = config["deploy_data"]
 
     print("=" * 65)
     print("  YAMHAMELACH - DEPLOYMENT TO DSFV (STREAMLIT CLOUD)")
     print("=" * 65)
+    print(f"  Profile: {config['db_profile']} ({config['db_label']})")
     print(f"  Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
     # ── Status mode ─────────────────────────────────────────

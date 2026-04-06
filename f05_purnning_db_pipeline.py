@@ -208,8 +208,9 @@ def prune_images(matches_db, image_input_dir, image_output_dir , type_="patches"
     return copied_count
 
 
-def load_config():
-    """Load configuration from .env file."""
+def load_config(db_name: str = None):
+    """Load configuration from .env file with DB profile support."""
+    from db_profile import resolve_profile
     from pathlib import Path
     try:
         from dotenv import dotenv_values
@@ -231,9 +232,8 @@ def load_config():
                     k, v = line.split("=", 1)
                     env[k.strip().lower()] = v.strip().strip('"').strip("'")
 
-    base_path = env.get("base_path", "")
-    output_dir = env.get("output_dir", "OUTPUT_faster_rcnn")
-    output_base = os.path.join(base_path, output_dir)
+    profile = resolve_profile(db_name)
+    output_base = profile.output_base
 
     patches_dir = env.get("patches_dir", "output_patches")
     bbox_dir = env.get("bbox_dir", "output_bbox")
@@ -242,6 +242,8 @@ def load_config():
     pruned_bbox = env.get("pruned_bbox_dir", "output_bbox_pruned")
 
     return {
+        "db_profile": profile.name,
+        "db_label": profile.label,
         "input_db": os.path.join(output_base, "matches.db"),
         "output_db": os.path.join(output_base, pruned_db),
         "input_patches": os.path.join(output_base, patches_dir),
@@ -254,7 +256,14 @@ def load_config():
 
 
 if __name__ == "__main__":
-    config = load_config()
+    import argparse
+    parser = argparse.ArgumentParser(description="Database Pruning Script")
+    parser.add_argument("--db", type=str, default=None,
+                        help="Database profile name (e.g. '180', '354')")
+    args = parser.parse_args()
+
+    config = load_config(db_name=args.db)
+    print(f"Database profile: {config['db_profile']} ({config['db_label']})")
 
     print("🔄 Starting database pruning...")
     print(f"  Input DB:  {config['input_db']}")
