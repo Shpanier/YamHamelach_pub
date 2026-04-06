@@ -185,35 +185,6 @@ def analyze_cache_dir(cache_path, label="Cache"):
     }
 
 
-def analyze_csv_files(base_path, env_config):
-    """Analyze CSV match files."""
-    csv_files = {}
-    csv_keys = [
-        "sift_matches", "sift_matches_w_tp", "sift_matches_w_tp_w_homo",
-        "clean_sift_matches_w_tp_w_homo", "sift_matches_1000"
-    ]
-    for key in csv_keys:
-        val = env_config.get(key, "")
-        if val:
-            csv_path = os.path.join(base_path, val)
-            if os.path.exists(csv_path):
-                stat = os.stat(csv_path)
-                # Count lines
-                try:
-                    with open(csv_path, 'r') as f:
-                        line_count = sum(1 for _ in f) - 1  # subtract header
-                except:
-                    line_count = -1
-                csv_files[key] = {
-                    "path": csv_path,
-                    "size": format_size(stat.st_size),
-                    "lines": line_count,
-                    "last_modified": format_time(stat.st_mtime),
-                }
-            else:
-                csv_files[key] = {"path": csv_path, "exists": False}
-    return csv_files
-
 
 def print_section(title, char="="):
     """Print a formatted section header."""
@@ -275,22 +246,30 @@ def main():
     # ── 2. Input/Output Folders ──────────────────────────────
     print_section("2. INPUT / OUTPUT FOLDER LOCATIONS", "-")
 
-    # Input folders
-    images_in = env_config.get("images_in", "")
-    input_path = os.path.join(base_path, images_in) if images_in else ""
+    # Input folders — iterate over all defined database profiles
+    from db_profile import list_profiles
+    try:
+        profiles = list_profiles()
+    except ValueError:
+        profiles = {}
     local_input = str(script_dir / "input_dead_see_images")
 
     print("\n  [INPUT FOLDERS]")
-    if input_path:
-        stats = get_folder_stats(input_path)
-        print_kv("Images input (from .env)", input_path, 4)
-        if stats["exists"]:
-            print_kv("Files", stats["file_count"], 6)
-            print_kv("Size", stats["total_size"], 6)
-            print_kv("Last addition", stats["last_modified"], 6)
-            print_kv("Extensions", stats["extensions"], 6)
-        else:
-            print_kv("Status", "DIRECTORY NOT FOUND", 6)
+    if profiles:
+        for pname, pinfo in profiles.items():
+            input_path = os.path.join(base_path, pinfo["images_in"]) if base_path else ""
+            if input_path:
+                stats = get_folder_stats(input_path)
+                print_kv(f"Profile '{pname}' images", input_path, 4)
+                if stats["exists"]:
+                    print_kv("Files", stats["file_count"], 6)
+                    print_kv("Size", stats["total_size"], 6)
+                    print_kv("Last addition", stats["last_modified"], 6)
+                    print_kv("Extensions", stats["extensions"], 6)
+                else:
+                    print_kv("Status", "DIRECTORY NOT FOUND", 6)
+    else:
+        print("    No database profiles found in .env")
 
     if os.path.exists(local_input):
         stats = get_folder_stats(local_input)

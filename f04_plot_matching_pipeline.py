@@ -5,9 +5,9 @@ This Streamlit app provides comprehensive tools to explore fragment matches
 with emphasis on homography error analysis.
 
 Requirements:
-pip install streamlit opencv-python numpy pandas plotly sqlite3 pillow
+pip install streamlit opencv-python numpy pandas plotly pillow
 
-Run with: streamlit run fragment_viewer.py
+Run with: streamlit run f04_plot_matching_pipeline.py
 """
 
 import streamlit as st
@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 import sqlite3
 import os
+import sys
 import pickle
 from PIL import Image
 import plotly.graph_objects as go
@@ -23,6 +24,31 @@ import plotly.express as px
 from typing import List, Tuple, Dict, Optional
 import base64
 from io import BytesIO
+
+
+def _get_default_paths():
+    """Resolve default paths from .env database profile."""
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        if script_dir not in sys.path:
+            sys.path.insert(0, script_dir)
+        from db_profile import resolve_profile
+        profile = resolve_profile()
+        output_base = profile.output_base
+        return {
+            "db_path": os.path.join(output_base, "matches.db"),
+            "image_base_path": os.path.join(output_base, "output_patches"),
+            "complete_image_path": os.path.join(output_base, "output_bbox"),
+        }
+    except Exception:
+        return {
+            "db_path": "",
+            "image_base_path": "",
+            "complete_image_path": "",
+        }
+
+
+_DEFAULTS = _get_default_paths()
 
 # Page configuration
 st.set_page_config(
@@ -381,19 +407,19 @@ def main():
         # Database and image path inputs
         db_path = st.text_input(
             "Database Path",
-            value="/Users/assafspanier/Dropbox/YamHamelach_data_n_model/OUTPUT_faster_rcnn/matches.db",
+            value=_DEFAULTS["db_path"],
             help="Path to the SQLite database with match results"
         )
 
         image_base_path = st.text_input(
             "Image Base Path",
-            value="/Users/assafspanier/Dropbox/YamHamelach_data_n_model/OUTPUT_faster_rcnn/output_patches",
+            value=_DEFAULTS["image_base_path"],
             help="Base directory containing fragment images"
         )
 
         complete_image_path = st.text_input(
             "Complete Image Path",
-            value="/Users/assafspanier/Dropbox/YamHamelach_data_n_model/OUTPUT_faster_rcnn/output_bbox",
+            value=_DEFAULTS["complete_image_path"],
             help="Base directory containing complete images (without fragment suffixes)"
         )
 

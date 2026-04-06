@@ -11,7 +11,6 @@ Architecture Overview:
 3. **Parallel Processing**: Multi-threaded matching with configurable workers
 4. **Resume Capability**: Track processed pairs to allow interrupted runs to continue
 5. **Validation System**: Cross-reference matches with ground truth data (PAM format)
-6. **Export System**: Generate analysis-ready CSV outputs
 
 Key Performance Features:
 ========================
@@ -941,57 +940,6 @@ class ParallelFragmentMatcher:
             print(f"Error during PAM validation: {e}")
             print("Continuing without validation...")
 
-    def export_top_matches(self, output_path: str, limit: int = 10000):
-        """
-        Export top matches to CSV for external analysis and visualization.
-
-        Creates a CSV file with the highest-confidence matches for further analysis.
-        This is useful for manual validation, statistical analysis, or integration
-        with other tools.
-
-        Args:
-            output_path (str): Path for output CSV file
-            limit (int): Maximum number of matches to export
-
-        Output Format:
-        - file1, file2: Fragment filenames
-        - match_count: Number of SIFT matches (quality indicator)
-        - is_validated: Boolean indicating ground truth validation
-
-        Usage Examples:
-        - Load in Excel/Google Sheets for manual review
-        - Import into R/Python for statistical analysis
-        - Feed into visualization tools for network analysis
-        """
-        import csv
-
-        print(f"Exporting top {limit} matches to: {output_path}")
-
-        try:
-            with open(output_path, 'w', newline='', encoding='utf-8') as csvfile:
-                writer = csv.writer(csvfile)
-
-                # Write header
-                writer.writerow(['file1', 'file2', 'match_count', 'is_validated'])
-
-                # Stream results to avoid memory issues
-                exported_count = 0
-                for row in self.db.get_top_matches(limit=limit):
-                    file1, file2, match_count, matches_data, is_validated = row
-                    writer.writerow([file1, file2, match_count, bool(is_validated)])
-                    exported_count += 1
-
-            print(f"Successfully exported {exported_count} matches")
-
-            # Provide basic statistics about exported data
-            if exported_count > 0:
-                stats = self.db.get_statistics()
-                print(f"Export represents {(exported_count / stats['total_matches'] * 100):.1f}% of total matches")
-
-        except Exception as e:
-            print(f"Error exporting matches: {e}")
-            raise
-
 
 # Environment configuration and deployment utilities
 import os
@@ -1039,12 +987,10 @@ def load_env_config(db_name: str = None):
         'cache_dir': os.path.join(output_base, os.getenv('PATCHES_CACHE', 'cache')),
         'db_path': os.path.join(output_base, os.getenv('DB_NAME', 'matches.db')),
         'pam_data_path': os.path.join(output_base, os.getenv('PAM_CSV', 'pam.csv')),
-        'output_csv_path': os.path.join(output_base, os.getenv('OUTPUT_CSV', 'top_matches.csv')),
 
         # Processing parameters
         'num_workers': int(os.getenv('NUM_WORKERS', '8')),
         'batch_size': int(os.getenv('BATCH_SIZE', '200')),
-        'export_limit': int(os.getenv('EXPORT_LIMIT', '10000')),
 
         # Debugging and monitoring
         'debug': os.getenv('DEBUG', 'false').lower() == 'true',
@@ -1061,13 +1007,12 @@ class OptimizedFragmentMatchingPipeline:
     Main pipeline controller that orchestrates the complete fragment matching workflow.
 
     This class provides a high-level interface for running the entire pipeline,
-    from initial setup through final result export. It handles configuration,
+    from initial setup through final analysis. It handles configuration,
     error recovery, and provides comprehensive monitoring.
 
     Pipeline Stages:
     1. **Feature Matching**: SIFT-based pairwise matching with database storage
     2. **Validation**: Cross-reference with ground truth data (PAM format)
-    3. **Export**: Generate analysis-ready CSV outputs
 
     Key Features:
     - Environment-based configuration for easy deployment
@@ -1085,7 +1030,6 @@ class OptimizedFragmentMatchingPipeline:
     # Or run individual stages
     pipeline.run_feature_matching()
     pipeline.run_validation()
-    pipeline.export_results()
     ```
     """
 
@@ -1129,7 +1073,6 @@ class OptimizedFragmentMatchingPipeline:
         directories_to_create = [
             os.path.dirname(self.config['cache_dir']),
             os.path.dirname(self.config['db_path']),
-            os.path.dirname(self.config['output_csv_path'])
         ]
 
         for directory in directories_to_create:
@@ -1263,57 +1206,6 @@ class OptimizedFragmentMatchingPipeline:
             print(f"ERROR in validation: {e}")
             print("Continuing pipeline without validation...")
 
-    def export_results(self):
-        """
-        Export top matches to CSV for external analysis and visualization.
-
-        This stage creates analysis-ready output files that can be used for:
-        - Manual validation and review
-        - Statistical analysis in R/Python
-        - Visualization and network analysis
-        - Integration with other research tools
-
-        Export Features:
-        - Sorted by match quality (highest confidence first)
-        - Includes validation status for ground truth analysis
-        - CSV format for universal compatibility
-        - Configurable export limits to manage file size
-
-        Output Format:
-        The CSV contains columns for fragment pairs, match counts,
-        and validation status, making it suitable for immediate use
-        in analysis workflows.
-        """
-        print("=" * 60)
-        print("STARTING EXPORT STAGE")
-        print("=" * 60)
-
-        print(f"Export limit: {self.config['export_limit']:,} matches")
-        print(f"Output file: {self.config['output_csv_path']}")
-
-        start_time = time.time()
-
-        try:
-            # Export top matches with configured limit
-            self.matcher.export_top_matches(
-                self.config['output_csv_path'],
-                limit=self.config['export_limit']
-            )
-
-            elapsed_time = time.time() - start_time
-
-            print(f"\nEXPORT COMPLETED")
-            print(f"Export time: {elapsed_time:.1f} seconds")
-
-            # Provide file information
-            if os.path.exists(self.config['output_csv_path']):
-                file_size = os.path.getsize(self.config['output_csv_path'])
-                print(f"Output file size: {file_size / 1024:.1f} KB")
-                print(f"Ready for analysis in Excel, R, Python, etc.")
-
-        except Exception as e:
-            print(f"ERROR in export: {e}")
-            raise
 
     def run_complete_pipeline(self):
         """
@@ -1322,7 +1214,6 @@ class OptimizedFragmentMatchingPipeline:
         This method orchestrates all pipeline stages in sequence:
         1. Feature matching with parallel processing
         2. Ground truth validation (if data available)
-        3. Results export for analysis
 
         The complete pipeline provides comprehensive error handling,
         performance monitoring, and detailed progress reporting.
@@ -1332,7 +1223,6 @@ class OptimizedFragmentMatchingPipeline:
         - Resume capability for handling interruptions
         - Scalable processing for large datasets
         - Quality metrics through ground truth validation
-        - Ready-to-use outputs for further research
 
         Expected Runtime:
         - Small datasets (100s of images): Minutes
@@ -1347,7 +1237,7 @@ class OptimizedFragmentMatchingPipeline:
         print("🔬 OPTIMIZED FRAGMENT MATCHING PIPELINE")
         print("=" * 60)
         print(f"Base path: {self.config['base_path']}")
-        print(f"Model type: {self.config['model_type']}")
+        print(f"Profile: {self.config['db_profile']} ({self.config['db_label']})")
         print(f"Configuration: {self.config['num_workers']} workers, batch size {self.config['batch_size']}")
         print("=" * 60)
 
@@ -1355,7 +1245,6 @@ class OptimizedFragmentMatchingPipeline:
             # Execute all pipeline stages
             self.run_feature_matching()
             self.run_validation()
-            self.export_results()
 
             # Calculate total pipeline time
             total_time = time.time() - pipeline_start_time
@@ -1374,7 +1263,6 @@ class OptimizedFragmentMatchingPipeline:
             print(f"  Total matches: {stats['total_matches']:,}")
             print(f"  Validated matches: {stats['validated_matches']:,}")
             print(f"  Database: {self.config['db_path']}")
-            print(f"  Exports: {self.config['output_csv_path']}")
             print("=" * 60)
             print("Ready for analysis! 📊")
 
@@ -1455,7 +1343,6 @@ def main():
     - --stage: Choose which pipeline stage to execute
       - 'matching': Feature matching only
       - 'validation': Validation only (requires existing matches)
-      - 'export': Export only (requires existing matches)
       - 'complete': Full pipeline (default)
       - 'info': Display database information only
     - --config: Path to custom .env configuration file
@@ -1501,7 +1388,7 @@ Examples:
 
     parser.add_argument(
         "--stage",
-        choices=["matching", "validation", "export", "complete", "info"],
+        choices=["matching", "validation", "complete", "info"],
         default="complete",
         help="Pipeline stage to execute (default: complete)"
     )
@@ -1536,8 +1423,6 @@ Examples:
             pipeline.run_feature_matching()
         elif args.stage == "validation":
             pipeline.run_validation()
-        elif args.stage == "export":
-            pipeline.export_results()
         elif args.stage == "info":
             pipeline.get_database_info()
         else:  # complete
@@ -1559,10 +1444,8 @@ Examples:
         print("  PATCHES_CACHE=cache")
         print("  DB_NAME=matches.db")
         print("  PAM_CSV=pam.csv")
-        print("  OUTPUT_CSV=top_matches.csv")
         print("  NUM_WORKERS=8")
         print("  BATCH_SIZE=200")
-        print("  EXPORT_LIMIT=10000")
         print("  DEBUG=false")
         print()
         print("Example .env file:")
@@ -1625,8 +1508,7 @@ BASE_PATH/
 │   ├── patches/           # Input images (any subdirectory structure)
 │   ├── cache/            # Feature cache (auto-created)
 │   ├── matches.db        # Results database (auto-created)
-│   ├── pam.csv          # Ground truth data (optional)
-│   └── top_matches.csv  # Exported results (auto-created)
+│   └── pam.csv          # Ground truth data (optional)
 ```
 
 Performance Tuning:

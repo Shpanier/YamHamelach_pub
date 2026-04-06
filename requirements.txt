@@ -3,8 +3,12 @@ matplotlib
 numpy
 opencv-python
 pandas
-tensorflow
-scikit-learn
 streamlit
-dropbox
-python-dotenv  
+python-dotenv
+torch
+torchvision
+Pillow
+tqdm
+psutil
+plotly
+numba

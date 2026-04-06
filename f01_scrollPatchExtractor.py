@@ -562,37 +562,6 @@ class ImagePatchExtractor:
         with open(info_file, "w") as file:
             json.dump(self._patch_info, file, indent=2)
 
-    def save_to_csv(self, csv_path):
-        """
-        Save detection results to a CSV file (compatible with Faster R-CNN format).
-
-        Args:
-            csv_path (str): Path to the output CSV file
-        """
-        import csv
-
-        os.makedirs(Path(csv_path).parent, exist_ok=True)
-
-        with open(csv_path, 'w', newline='') as csvfile:
-            fieldnames = ['image_path', 'x1', 'y1', 'x2', 'y2', 'confidence', 'tag', 'model_type']
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-
-            writer.writeheader()
-            for i, box in enumerate(self._extracted_boxes):
-                left, top, right, bottom = box
-                confidence = self._scores[i] if self._scores else 1.0
-                tag = self.tags[i]
-
-                writer.writerow({
-                    'image_path': self._img_filename,
-                    'x1': left,
-                    'y1': top,
-                    'x2': right,
-                    'y2': bottom,
-                    'confidence': confidence,
-                    'tag': tag,
-                    'model_type': self._model_type.value
-                })
 
 
 def load_args():
@@ -693,7 +662,6 @@ if __name__ == "__main__":
        - Save detection visualization
        - Extract and save individual patches
        - Save patch metadata
-       - Save CSV results (for compatibility)
     
     Progress is displayed using tqdm progress bar.
     """
@@ -744,9 +712,6 @@ if __name__ == "__main__":
             # Save patch information as JSON
             patch_finder.save_patch_info(patches_filepath)
 
-            # Save results as CSV (for compatibility with existing workflows)
-            csv_filename = Path(patches_filepath, f"{img_filename.stem}.csv")
-            patch_finder.save_to_csv(csv_filename)
 
         except Exception as e:
             print(f"Error processing {img_filename}: {str(e)}")

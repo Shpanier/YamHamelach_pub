@@ -69,15 +69,13 @@ def list_profiles(env_path: str = None) -> dict:
                 "label": label,
             }
 
-    # Fallback: if no profiles defined, create one from legacy IMAGES_IN / OUTPUT_DIR
+    # Fallback: if no profiles defined, raise an error
     if not profiles:
-        images_in = env.get("images_in", "all_180_images/")
-        output_dir = env.get("output_dir", "OUTPUT_faster_rcnn")
-        profiles["default"] = {
-            "images_in": images_in,
-            "output_dir": output_dir,
-            "label": "Default",
-        }
+        raise ValueError(
+            "No database profiles found in .env. "
+            "Define at least one profile using DB_PROFILE_<NAME>_IMAGES_IN "
+            "and DB_PROFILE_<NAME>_OUTPUT_DIR."
+        )
 
     return profiles
 

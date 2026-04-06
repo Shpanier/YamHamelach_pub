@@ -78,7 +78,7 @@ def get_profile_paths(profile_name: str = None):
         profile = resolve_profile(profile_name)
         output_base = profile.output_base
     except Exception:
-        output_base = '/Users/assafspanier/Dropbox/YamHamelach_data_n_model/OUTPUT_faster_rcnn'
+        output_base = ''
 
     return {
         'db_path': os.path.join(output_base, 'matches.db'),

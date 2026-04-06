@@ -12,7 +12,6 @@ This version includes all Phase 1 optimizations plus:
 5. Memory-mapped caching for large datasets
 """
 
-import csv
 import math
 import os
 import pickle
@@ -1402,41 +1401,6 @@ class ParallelHomographyProcessor:
 
         print("\n" + "="*70)
 
-    def export_results_to_csv(self, output_path: str, limit: int = 10000, max_error: float = 10.0):
-        """Export best matches with homography errors to CSV with progress tracking."""
-        print(f"\n📁 Exporting matches to CSV")
-        print(f"  Output file: {output_path}")
-        print(f"  Max error threshold: {max_error} pixels")
-        print(f"  Max results: {limit:,}")
-
-        print("\n  Querying database...", end='', flush=True)
-
-        # Get count first for progress bar
-        results = list(self.db.get_best_matches_with_homography(limit, max_error))
-        total_results = len(results)
-        print(f" found {total_results:,} matches")
-
-        if total_results == 0:
-            print("  ⚠️  No matches found with specified criteria")
-            return
-
-        print("  Writing CSV file...")
-
-        # Progress bar for export
-        with tqdm(total=total_results, desc="  Exporting", unit="rows") as pbar:
-            with open(output_path, 'w', newline='', encoding='utf-8') as csvfile:
-                writer = csv.writer(csvfile)
-
-                # Write header
-                writer.writerow(['file1', 'file2', 'match_count', 'mean_homo_err', 'is_validated'])
-                pbar.update(0)
-
-                # Write data
-                for row in results:
-                    writer.writerow(row)
-                    pbar.update(1)
-
-        print(f"\n✅ Successfully exported {total_results:,} matches to {os.path.basename(output_path)}")
 
 
 def load_config(db_name: str = None):
@@ -1464,12 +1428,10 @@ def load_config(db_name: str = None):
         'image_base_path': os.path.join(output_base, os.getenv('PATCHES_DIR', 'patches')),
         'feature_cache_dir': os.path.join(output_base, os.getenv('PATCHES_CACHE', 'cache')),
         'error_cache_dir': os.path.join(output_base, os.getenv('ERROR_CACHE', 'error_cache')),
-        'output_csv': os.path.join(output_base, os.getenv('HOMO_CSV', 'homography_matches.csv')),
         'num_workers': int(os.getenv('NUM_WORKERS', str(batch_sizer.get_optimal_workers(8)))),
         'batch_size': int(os.getenv('BATCH_SIZE', str(batch_sizer.get_optimal_batch_size(500)))),
         'process_limit': int(os.getenv('PROCESS_LIMIT', '0')) or None,
         'max_error': float(os.getenv('MAX_HOMO_ERROR', '10.0')),
-        'export_limit': int(os.getenv('EXPORT_LIMIT', '10000')),
         'min_match_count': int(os.getenv('MIN_MATCH_COUNT', '0')),
 
         # Early pruning (0 = disabled)
@@ -1490,7 +1452,7 @@ def main():
 
     parser.add_argument(
         "--mode",
-        choices=["process", "export", "stats", "all"],
+        choices=["process", "stats", "all"],
         default="all",
         help="Operation mode (default: all)"
     )
@@ -1542,12 +1504,6 @@ def main():
                 limit=config['process_limit']
             )
 
-        if args.mode in ["export", "all"]:
-            processor.export_results_to_csv(
-                output_path=config['output_csv'],
-                limit=config['export_limit'],
-                max_error=config['max_error']
-            )
 
         if args.mode in ["stats", "all"]:
             print("\n📊 DATABASE STATISTICS")
